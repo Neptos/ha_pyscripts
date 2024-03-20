@@ -1,5 +1,4 @@
 from datetime import datetime, timedelta, timezone
-from HassService import _get_statistic
 
 
 def _get_long_term_prices():

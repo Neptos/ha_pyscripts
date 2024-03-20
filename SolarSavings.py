@@ -1,5 +1,4 @@
 from datetime import datetime, timedelta
-from HassService import _get_history, _get_statistic
 
 
 def _add_value_to_sensor(value, sensor_id):
