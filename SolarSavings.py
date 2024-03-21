@@ -76,6 +76,7 @@ def calculateSolarSavingsLastHour():
     nibe_energy_used_last_hour_kwh_total_entity_id = 'sensor.nibe_energy_used_last_hour'
 
     # Write entities
+    # These have to be created as helpers in HA
     solar_savings_entity_id = 'input_number.solar_savings'
     car_charge_cost_without_solar_entity_id = 'input_number.car_charge_without_solar'
     car_charge_cost_with_solar_entity_id = 'input_number.car_charge_with_solar'
@@ -118,8 +119,7 @@ def calculateSolarSavingsLastHour():
     car_share_of_purchase = 0.0
     heat_pump_share_of_purchase = 0.0
     if last_hour_purchased_kwh > 0.001:
-        # partial purchase with solar
-        # Consumers share solar based on usage
+        # Consumers share purchased cost based on their % usage of total
         car_share_of_purchase = last_hour_charged_kwh / (last_hour_purchased_kwh + last_hour_produced_kwh)
         heat_pump_share_of_purchase = last_hour_heat_pump_used_kwh / (last_hour_purchased_kwh + last_hour_produced_kwh)
 
