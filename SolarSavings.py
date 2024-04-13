@@ -82,6 +82,7 @@ def calculateSolarSavingsLastHour():
     car_charge_cost_with_solar_entity_id = 'input_number.car_charge_with_solar'
     heat_pump_cost_without_solar_entity_id = 'input_number.heat_pump_cost_without_solar'
     heat_pump_cost_with_solar_entity_id = 'input_number.heat_pump_cost_with_solar'
+    heat_pump_consumed_kwh_entity_id = 'input_number.heat_pump_consumed_kwh'
 
     # Start and end of last hour
     last_hour_start = datetime.now() - timedelta(hours=1)
@@ -138,3 +139,6 @@ def calculateSolarSavingsLastHour():
     heat_pump_cost_with_solar_last_hour = _calculate_heat_pump_cost_with_solar_last_hour(last_hour_buy_price, last_hour_purchased_kwh, heat_pump_share_of_purchase)
     _sum_value_to_sensor(heat_pump_cost_without_solar_last_hour, heat_pump_cost_without_solar_entity_id)
     _sum_value_to_sensor(heat_pump_cost_with_solar_last_hour, heat_pump_cost_with_solar_entity_id)
+
+    # Heat pump all time consumption
+    _sum_value_to_sensor(last_hour_heat_pump_used_kwh, heat_pump_consumed_kwh_entity_id)
