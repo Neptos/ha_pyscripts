@@ -33,11 +33,40 @@ def _get_long_term_prices():
     return stat
 
 @service
-def manualUpdateSpotPriceSensors(action=None, id=None):
-    """Service to manually run the spot price sensor updater"""
-    log.warning(f"Manually triggering update spot price sensors")
+def spotPriceSensorsTestService(action=None, id=None):
+    """Service to execute code through HA"""
+    log.warning(f"Manually triggering test service")
 
-    updateSpotPriceSensors()
+
+@time_trigger("cron(1 * * * *)")
+def calculateSpotPriceAverages():
+    """Calculates monthly and yearly spot price averages"""
+
+    buy_price_entity_id = 'sensor.electricity_buy_price'
+
+    monthly_start_date = datetime.now()
+    monthly_start_date = monthly_start_date.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    monthly_end_date = datetime.now()
+    monthly_end_date = monthly_end_date.replace(month=monthly_end_date.month+1, day=1, hour=0, minute=0, second=0, microsecond=0)
+
+    monthly_raw = _get_statistic(monthly_start_date, monthly_end_date, [buy_price_entity_id], "hour", ['state'])
+    monthly_floats = [{'start': d.get('start'), 'value': float(d.get('state'))} for d in monthly_raw.get(buy_price_entity_id)]
+    monthly_prices = [d['value'] for d in monthly_floats if 'value' in d]
+    monthly_avg = sum(monthly_prices) / len(monthly_prices)
+
+    input_number.electricity_buy_price_monthly_average = monthly_avg
+
+    yearly_start_date = datetime.now()
+    yearly_start_date = yearly_start_date.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+    yearly_end_date = datetime.now()
+    yearly_end_date = yearly_end_date.replace(year=yearly_end_date.year+1, month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+
+    yearly_raw = _get_statistic(yearly_start_date, yearly_end_date, [buy_price_entity_id], "hour", ['state'])
+    yearly_floats = [{'start': d.get('start'), 'value': float(d.get('state'))} for d in yearly_raw.get(buy_price_entity_id)]
+    yearly_prices = [d['value'] for d in yearly_floats if 'value' in d]
+    yearly_avg = sum(yearly_prices) / len(yearly_prices)
+
+    input_number.electricity_buy_price_yearly_average = yearly_avg
 
 
 @time_trigger("cron(2 * * * *)")
