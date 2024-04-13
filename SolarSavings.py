@@ -33,7 +33,7 @@ async def _get_history(
     return (await get_instance(hass).async_add_executor_job(get_significant_states, hass, start_time, end_time, entity_ids, None, include_start_time_state, significant_changes_only, minimal_response, no_attributes, False))
 
 
-def _add_value_to_sensor(value, sensor_id):
+def _sum_value_to_sensor(value, sensor_id):
     current_value = float(state.get(sensor_id))
     attributes = state.getattr(sensor_id)
     if attributes is None or 'device_class' not in attributes.keys():
@@ -125,16 +125,16 @@ def calculateSolarSavingsLastHour():
 
     # Overall solar savings
     overall_savings_last_hour = _calculate_overall_solar_savings_last_hour(last_hour_exported_kwh, last_hour_produced_kwh, last_hour_buy_price, last_hour_sell_price)
-    _add_value_to_sensor(overall_savings_last_hour, solar_savings_entity_id)
+    _sum_value_to_sensor(overall_savings_last_hour, solar_savings_entity_id)
 
     # Car charge cost and savings
     car_charge_cost_without_solar_last_hour = _calculate_car_charge_cost_without_solar_last_hour(last_hour_buy_price, last_hour_charged_kwh)
     car_charge_cost_with_solar_last_hour = _calculate_car_charge_cost_with_solar_last_hour(last_hour_buy_price, last_hour_purchased_kwh, car_share_of_purchase)
-    _add_value_to_sensor(car_charge_cost_without_solar_last_hour, car_charge_cost_without_solar_entity_id)
-    _add_value_to_sensor(car_charge_cost_with_solar_last_hour, car_charge_cost_with_solar_entity_id)
+    _sum_value_to_sensor(car_charge_cost_without_solar_last_hour, car_charge_cost_without_solar_entity_id)
+    _sum_value_to_sensor(car_charge_cost_with_solar_last_hour, car_charge_cost_with_solar_entity_id)
 
     # Heat pump cost and savings
     heat_pump_cost_without_solar_last_hour = _calculate_heat_pump_cost_without_solar_last_hour(last_hour_buy_price, last_hour_heat_pump_used_kwh)
     heat_pump_cost_with_solar_last_hour = _calculate_heat_pump_cost_with_solar_last_hour(last_hour_buy_price, last_hour_purchased_kwh, heat_pump_share_of_purchase)
-    _add_value_to_sensor(heat_pump_cost_without_solar_last_hour, heat_pump_cost_without_solar_entity_id)
-    _add_value_to_sensor(heat_pump_cost_with_solar_last_hour, heat_pump_cost_with_solar_entity_id)
+    _sum_value_to_sensor(heat_pump_cost_without_solar_last_hour, heat_pump_cost_without_solar_entity_id)
+    _sum_value_to_sensor(heat_pump_cost_with_solar_last_hour, heat_pump_cost_with_solar_entity_id)
