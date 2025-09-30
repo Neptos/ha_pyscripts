@@ -39,6 +39,41 @@ def _get_long_term_prices():
 
     return stat
 
+
+def _normalize_price_data(price_dictionaries):
+    """Normalize price data to 15-minute intervals.
+
+    Handles mixed format where some entries may span a full hour (due to timezone
+    differences) by splitting hourly entries into 4 equal 15-minute prices.
+    """
+    normalized = []
+
+    for entry in price_dictionaries:
+        if 'start' not in entry or 'end' not in entry or 'value' not in entry:
+            # Keep entries without proper start/end/value as-is
+            normalized.append(entry)
+            continue
+
+        start = datetime.fromisoformat(entry['start'].replace('Z', '+00:00'))
+        end = datetime.fromisoformat(entry['end'].replace('Z', '+00:00'))
+        duration_minutes = (end - start).total_seconds() / 60
+
+        # If duration is roughly 1 hour (allow small variations), split into 4x15min
+        if duration_minutes > 45:
+            for i in range(4):
+                interval_start = start + timedelta(minutes=15 * i)
+                interval_end = start + timedelta(minutes=15 * (i + 1))
+                normalized.append({
+                    'start': interval_start.isoformat(),
+                    'end': interval_end.isoformat(),
+                    'value': entry['value']
+                })
+        else:
+            # Already 15-minute (or other) interval, keep as-is
+            normalized.append(entry)
+
+    return normalized
+
 @service
 def spotPriceSensorsTestService(action=None, id=None):
     """Service to execute code through HA"""
@@ -84,7 +119,8 @@ def updateSpotPriceSensors():
     # Spot price sensor
     spot_price_sensor = sensor.nordpool_kwh_fi_eur_3_10_0
 
-    price_dictionaries = spot_price_sensor.raw_today
+    # Normalize to handle mixed hourly/15-min format
+    price_dictionaries = _normalize_price_data(spot_price_sensor.raw_today)
 
     prices = [d['value'] for d in price_dictionaries if 'value' in d]
     price_average_today = sum(prices) / len(prices)
@@ -94,7 +130,7 @@ def updateSpotPriceSensors():
     price_75_percent_today = (price_average_today + price_max_today) / 2
 
     if spot_price_sensor.tomorrow_valid:
-        price_dictionaries += spot_price_sensor.raw_tomorrow
+        price_dictionaries += _normalize_price_data(spot_price_sensor.raw_tomorrow)
 
     prices = [d['value'] for d in price_dictionaries if 'value' in d]
     price_average_short = sum(prices) / len(prices)
