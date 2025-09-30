@@ -2,9 +2,9 @@ from homeassistant.components.recorder import get_instance
 from homeassistant.components.recorder.history import get_significant_states
 from homeassistant.components.recorder.statistics import statistics_during_period
 from datetime import datetime, timezone, timedelta
+import asyncio
 
-
-async def _get_statistic(
+def _get_statistic(
     start_time: datetime,
     end_time: datetime | None,
     statistic_ids: list[str] | None,
@@ -14,8 +14,14 @@ async def _get_statistic(
     # This is probably not needed so leaving it commented out
     #start_time = start_time.astimezone(timezone.utc)
     #end_time = end_time.astimezone(timezone.utc)
-
-    return(await get_instance(hass).async_add_executor_job(statistics_during_period, hass, start_time, end_time, statistic_ids, period, None, types))
+    counter = 0
+    task = get_instance(hass).async_add_executor_job(statistics_during_period, hass, start_time, end_time, statistic_ids, period, None, types)
+    while not task.done():
+        asyncio.sleep(1)
+        counter = counter + 1
+        if counter > 10:
+            break
+    return task.result()
 
 
 async def _get_history(
@@ -30,7 +36,16 @@ async def _get_history(
     start_time = start_time.astimezone(timezone.utc)
     end_time = end_time.astimezone(timezone.utc)
 
-    return (await get_instance(hass).async_add_executor_job(get_significant_states, hass, start_time, end_time, entity_ids, None, include_start_time_state, significant_changes_only, minimal_response, no_attributes, False))
+    counter = 0
+    task = get_instance(hass).async_add_executor_job(get_significant_states, hass, start_time, end_time, entity_ids, None, include_start_time_state, significant_changes_only, minimal_response, no_attributes, False)
+    while not task.done():
+        asyncio.sleep(1)
+        counter = counter + 1
+        if counter > 10:
+            break
+    return task.result()
+
+#    return (await get_instance(hass).async_add_executor_job(get_significant_states, hass, start_time, end_time, entity_ids, None, include_start_time_state, significant_changes_only, minimal_response, no_attributes, False))
 
 
 def _sum_value_to_sensor(value, sensor_id):
@@ -67,7 +82,7 @@ def _calculate_heat_pump_cost_with_solar_last_hour(last_hour_buy_price, last_hou
 def calculateSolarSavingsLastHour():
     """Calculate the savings from solar panels during the previous hour"""
     # Read entities
-    buy_price_entity_id = 'sensor.electricity_buy_price'
+    buy_price_entity_id = 'sensor.nordpool_kwh_fi_eur_3_10_0'
     sell_price_entity_id = 'sensor.electricity_sell_price'
     tesla_wallconnector_energy_entity_id = 'sensor.tesla_wall_connector_energy'
     purchased_kwh_total_entity_id = 'sensor.power_meter_consumption'

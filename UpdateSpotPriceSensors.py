@@ -1,9 +1,9 @@
 from homeassistant.components.recorder import get_instance
 from homeassistant.components.recorder.statistics import statistics_during_period
 from datetime import datetime, timedelta
+import asyncio
 
-
-async def _get_statistic(
+def _get_statistic(
     start_time: datetime,
     end_time: datetime | None,
     statistic_ids: list[str] | None,
@@ -13,8 +13,14 @@ async def _get_statistic(
     # This is probably not needed so leaving it commented out
     #start_time = start_time.astimezone(timezone.utc)
     #end_time = end_time.astimezone(timezone.utc)
-
-    return(await get_instance(hass).async_add_executor_job(statistics_during_period, hass, start_time, end_time, statistic_ids, period, None, types))
+    counter = 0
+    task = get_instance(hass).async_add_executor_job(statistics_during_period, hass, start_time, end_time, statistic_ids, period, None, types)
+    while not task.done():
+        asyncio.sleep(1)
+        counter = counter + 1
+        if counter > 10:
+            break
+    return task.result()
 
 
 def _get_long_term_prices():
@@ -25,7 +31,8 @@ def _get_long_term_prices():
     end_date = datetime.now()
     end_date = end_date.replace(hour=0, minute=0, second=0, microsecond=0)
 
-    sensor = 'sensor.nordpool_spotprice_no_transfer'
+    # Buy price sensor
+    sensor = 'sensor.nordpool_kwh_fi_eur_3_10_0255'
 
     stats = _get_statistic(start_date, end_date, [sensor], "hour", ['state'])
     stat = [{'start': d.get('start'), 'value': float(d.get('state'))} for d in stats.get(sensor)]
@@ -36,13 +43,14 @@ def _get_long_term_prices():
 def spotPriceSensorsTestService(action=None, id=None):
     """Service to execute code through HA"""
     log.warning(f"Manually triggering test service")
-
+    calculateSpotPriceAverages()
+    updateSpotPriceSensors()
 
 @time_trigger("cron(1 * * * *)")
 def calculateSpotPriceAverages():
     """Calculates monthly and yearly spot price averages"""
 
-    buy_price_entity_id = 'sensor.electricity_buy_price'
+    buy_price_entity_id = 'sensor.nordpool_kwh_fi_eur_3_10_0'
 
     monthly_start_date = datetime.now()
     monthly_start_date = monthly_start_date.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
@@ -73,7 +81,10 @@ def calculateSpotPriceAverages():
 def updateSpotPriceSensors():
     """Update spot price sensors based on future spot prices"""
 
-    price_dictionaries = sensor.nordpool_spotprice_no_transfer.raw_today
+    # Spot price sensor
+    spot_price_sensor = sensor.nordpool_kwh_fi_eur_3_10_0
+
+    price_dictionaries = spot_price_sensor.raw_today
 
     prices = [d['value'] for d in price_dictionaries if 'value' in d]
     price_average_today = sum(prices) / len(prices)
@@ -82,8 +93,8 @@ def updateSpotPriceSensors():
     price_25_percent_today = (price_average_today + price_min_today) / 2
     price_75_percent_today = (price_average_today + price_max_today) / 2
 
-    if sensor.nordpool_spotprice_no_transfer.tomorrow_valid:
-        price_dictionaries += sensor.nordpool_spotprice_no_transfer.raw_tomorrow
+    if spot_price_sensor.tomorrow_valid:
+        price_dictionaries += spot_price_sensor.raw_tomorrow
 
     prices = [d['value'] for d in price_dictionaries if 'value' in d]
     price_average_short = sum(prices) / len(prices)
@@ -100,7 +111,7 @@ def updateSpotPriceSensors():
     price_25_percent_long = (price_average_long + price_min_long) / 2
     price_75_percent_long = (price_average_long + price_max_long) / 2
 
-    price_current = sensor.nordpool_spotprice_no_transfer.current_price
+    price_current = spot_price_sensor.current_price
 
     input_number.spot_price_cost.price_current = price_current
     input_number.spot_price_cost.price_average_short = price_average_short
