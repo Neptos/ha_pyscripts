@@ -32,7 +32,7 @@ def _get_long_term_prices():
     end_date = end_date.replace(hour=0, minute=0, second=0, microsecond=0)
 
     # Buy price sensor
-    sensor = 'sensor.nordpool_kwh_fi_eur_3_10_0255'
+    sensor = 'sensor.nordpool_kwh_fi_eur_3_10_0'
 
     stats = _get_statistic(start_date, end_date, [sensor], "hour", ['state'])
     stat = [{'start': d.get('start'), 'value': float(d.get('state'))} for d in stats.get(sensor)]
@@ -112,7 +112,7 @@ def calculateSpotPriceAverages():
     input_number.electricity_buy_price_yearly_average = yearly_avg
 
 
-@time_trigger("cron(2 * * * *)")
+@time_trigger("cron(2,17,32,47 * * * *)")
 def updateSpotPriceSensors():
     """Update spot price sensors based on future spot prices"""
 
