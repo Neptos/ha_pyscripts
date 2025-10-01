@@ -101,13 +101,13 @@ def _calculate_weighted_average_price(start_time, end_time, price_entity_id, con
 
             if price_start:
                 # Find consumption during this price interval
-                # Handle both string and datetime objects
-                log.warning(f"price_start type: {type(price_start)}, value: {price_start}")
+                # Handle string, float (Unix timestamp), and datetime objects
                 if isinstance(price_start, str):
                     interval_start = datetime.fromisoformat(price_start.replace('Z', '+00:00'))
+                elif isinstance(price_start, (int, float)):
+                    interval_start = datetime.fromtimestamp(price_start, tz=timezone.utc)
                 else:
                     interval_start = price_start
-                log.warning(f"interval_start type: {type(interval_start)}, value: {interval_start}")
                 interval_end = interval_start + timedelta(minutes=15)
 
                 # Find history points within this interval
