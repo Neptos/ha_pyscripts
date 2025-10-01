@@ -86,7 +86,7 @@ def _calculate_weighted_average_price(start_time, end_time, price_entity_id, con
 
         if not consumption_history or consumption_entity_id not in consumption_history or len(consumption_history[consumption_entity_id]) < 2:
             # Fallback to simple average if consumption history unavailable
-            return sum(float(p['state']) for p in prices) / len(prices)
+            return sum([float(p['state']) for p in prices]) / len(prices)
 
         history = consumption_history[consumption_entity_id]
 
@@ -101,7 +101,11 @@ def _calculate_weighted_average_price(start_time, end_time, price_entity_id, con
 
             if price_start:
                 # Find consumption during this price interval
-                interval_start = datetime.fromisoformat(price_start.replace('Z', '+00:00'))
+                # Handle both string and datetime objects
+                if isinstance(price_start, str):
+                    interval_start = datetime.fromisoformat(price_start.replace('Z', '+00:00'))
+                else:
+                    interval_start = price_start
                 interval_end = interval_start + timedelta(minutes=15)
 
                 # Find history points within this interval
@@ -123,7 +127,7 @@ def _calculate_weighted_average_price(start_time, end_time, price_entity_id, con
             return total_weighted_price / total_consumption
         else:
             # No consumption detected, return simple average of prices
-            return sum(float(p['state']) for p in prices) / len(prices)
+            return sum([float(p['state']) for p in prices]) / len(prices)
 
     except Exception as e:
         log.warning(f"Error calculating weighted price, using simple average: {e}")
@@ -132,7 +136,7 @@ def _calculate_weighted_average_price(start_time, end_time, price_entity_id, con
             price_stats = _get_statistic(start_time, end_time, [price_entity_id], "hour", ['state'])
             if price_stats and price_entity_id in price_stats:
                 prices = price_stats[price_entity_id]
-                return sum(float(p['state']) for p in prices) / len(prices)
+                return sum([float(p['state']) for p in prices]) / len(prices)
         except:
             pass
         return None

@@ -54,8 +54,13 @@ def _normalize_price_data(price_dictionaries):
             normalized.append(entry)
             continue
 
-        start = datetime.fromisoformat(entry['start'].replace('Z', '+00:00'))
-        end = datetime.fromisoformat(entry['end'].replace('Z', '+00:00'))
+        # Handle both string and datetime objects
+        start = entry['start']
+        if isinstance(start, str):
+            start = datetime.fromisoformat(start.replace('Z', '+00:00'))
+        end = entry['end']
+        if isinstance(end, str):
+            end = datetime.fromisoformat(end.replace('Z', '+00:00'))
         duration_minutes = (end - start).total_seconds() / 60
 
         # If duration is roughly 1 hour (allow small variations), split into 4x15min
