@@ -3,6 +3,13 @@ from homeassistant.components.recorder.statistics import statistics_during_perio
 from datetime import datetime, timedelta
 import asyncio
 
+# Lookahead smoothing configuration
+LOOKAHEAD_INTERVALS_HEATING = 16  # 4 hours for heating
+LOOKAHEAD_INTERVALS_HOT_WATER = 4  # 1 hour for hot water
+LOOKAHEAD_MAJORITY_THRESHOLD = 0.75
+MIN_LOOKAHEAD_INTERVALS = 2  # Minimum 30 min of lookahead required
+FALLBACK_COST_VALUE = 3  # Assume expensive when unavailable
+
 def _get_statistic(
     start_time: datetime,
     end_time: datetime | None,
@@ -79,6 +86,89 @@ def _normalize_price_data(price_dictionaries):
 
     return normalized
 
+
+def _calculate_cost_for_price(price, threshold_cheap, threshold_avg, threshold_expensive):
+    """Calculate 0-3 cost for a given price and thresholds."""
+    if price < threshold_cheap:
+        return 0
+    elif price < threshold_avg:
+        return 1
+    elif price < threshold_expensive:
+        return 2
+    else:
+        return 3
+
+
+def _get_future_prices(normalized_today, normalized_tomorrow, tomorrow_valid, max_intervals):
+    """Get list of upcoming 15-min prices from now.
+
+    Args:
+        normalized_today: Normalized price list for today
+        normalized_tomorrow: Normalized price list for tomorrow
+        tomorrow_valid: Whether tomorrow's prices are available
+        max_intervals: Maximum number of intervals to return
+
+    Returns:
+        List of price values for upcoming intervals
+    """
+    now = datetime.now().astimezone()
+    future_prices = []
+
+    # Combine today and tomorrow (if available)
+    all_prices = list(normalized_today)
+    if tomorrow_valid and normalized_tomorrow:
+        all_prices.extend(normalized_tomorrow)
+
+    for entry in all_prices:
+        if 'start' not in entry or 'value' not in entry:
+            continue
+
+        start = entry['start']
+        if isinstance(start, str):
+            start = datetime.fromisoformat(start.replace('Z', '+00:00'))
+
+        # Check if this interval is in the future
+        if start >= now:
+            future_prices.append(entry['value'])
+            if len(future_prices) >= max_intervals:
+                break
+
+    return future_prices
+
+
+def _calculate_smoothed_cost(price_current, current_zone, thresholds, future_prices):
+    """Only change zone if threshold crossing is sustained.
+
+    Args:
+        price_current: Current electricity price
+        current_zone: Current displayed cost zone (0-3)
+        thresholds: Tuple of (threshold_cheap, threshold_avg, threshold_expensive)
+        future_prices: List of future prices for lookahead
+
+    Returns:
+        Tuple of (smoothed_zone, raw_zone, agreement_ratio)
+    """
+    raw_zone = _calculate_cost_for_price(price_current, *thresholds)
+
+    # If no zone change, keep current
+    if raw_zone == current_zone:
+        return current_zone, raw_zone, 1.0
+
+    # If insufficient lookahead data, use raw zone
+    if len(future_prices) < MIN_LOOKAHEAD_INTERVALS:
+        return raw_zone, raw_zone, 1.0
+
+    # Zone change detected - check if sustained
+    future_zones = [_calculate_cost_for_price(p, *thresholds) for p in future_prices]
+    matching_count = sum(1 for z in future_zones if z == raw_zone)
+    agreement = matching_count / len(future_zones)
+
+    if agreement >= LOOKAHEAD_MAJORITY_THRESHOLD:
+        return raw_zone, raw_zone, agreement  # Change zone
+    else:
+        return current_zone, raw_zone, agreement  # Stay in current zone
+
+
 @service
 def spotPriceSensorsTestService(action=None, id=None):
     """Service to execute code through HA"""
@@ -154,6 +244,73 @@ def updateSpotPriceSensors():
 
     price_current = spot_price_sensor.current_price
 
+    # Get future prices for lookahead (need normalized data before adding long-term)
+    normalized_today = _normalize_price_data(spot_price_sensor.raw_today)
+    normalized_tomorrow = []
+    if spot_price_sensor.tomorrow_valid:
+        normalized_tomorrow = _normalize_price_data(spot_price_sensor.raw_tomorrow)
+
+    # Get future prices for heating (4 hours) and hot water (1 hour)
+    future_prices_heating = _get_future_prices(
+        normalized_today, normalized_tomorrow,
+        spot_price_sensor.tomorrow_valid, LOOKAHEAD_INTERVALS_HEATING
+    )
+    future_prices_hot_water = _get_future_prices(
+        normalized_today, normalized_tomorrow,
+        spot_price_sensor.tomorrow_valid, LOOKAHEAD_INTERVALS_HOT_WATER
+    )
+
+    # --- HEATING INDICATOR (long-term based, 4-hour smoothing) ---
+    threshold_cheap_long = (price_average_long + price_min_long) / 2
+    threshold_expensive_long = (price_average_long + price_max_long) / 2
+    thresholds_long = (threshold_cheap_long, price_average_long, threshold_expensive_long)
+
+    # Get current zone from existing input_number (persists across runs)
+    try:
+        current_zone_heating = int(float(state.get('input_number.spot_price_cost_heating')))
+    except:
+        current_zone_heating = FALLBACK_COST_VALUE  # Default to expensive on first run
+
+    # Calculate with threshold-crossing smoothing
+    smoothed_zone_heating, raw_zone_heating, agreement_heating = _calculate_smoothed_cost(
+        price_current, current_zone_heating, thresholds_long, future_prices_heating
+    )
+
+    # Store heating indicator
+    input_number.spot_price_cost_heating = smoothed_zone_heating
+    input_number.spot_price_cost_heating.threshold_cheap = threshold_cheap_long
+    input_number.spot_price_cost_heating.threshold_avg = price_average_long
+    input_number.spot_price_cost_heating.threshold_expensive = threshold_expensive_long
+    input_number.spot_price_cost_heating.raw_cost = raw_zone_heating
+    input_number.spot_price_cost_heating.lookahead_agreement = agreement_heating
+    input_number.spot_price_cost_heating.price_current = price_current
+
+    # --- HOT WATER INDICATOR (short-term based, 1-hour smoothing) ---
+    threshold_cheap_short = (price_average_short + price_min_short) / 2
+    threshold_expensive_short = (price_average_short + price_max_short) / 2
+    thresholds_short = (threshold_cheap_short, price_average_short, threshold_expensive_short)
+
+    # Get current zone
+    try:
+        current_zone_hw = int(float(state.get('input_number.spot_price_cost_hot_water')))
+    except:
+        current_zone_hw = FALLBACK_COST_VALUE
+
+    # Calculate with 1-hour threshold-crossing smoothing
+    smoothed_zone_hw, raw_zone_hw, agreement_hw = _calculate_smoothed_cost(
+        price_current, current_zone_hw, thresholds_short, future_prices_hot_water
+    )
+
+    # Store hot water indicator
+    input_number.spot_price_cost_hot_water = smoothed_zone_hw
+    input_number.spot_price_cost_hot_water.threshold_cheap = threshold_cheap_short
+    input_number.spot_price_cost_hot_water.threshold_avg = price_average_short
+    input_number.spot_price_cost_hot_water.threshold_expensive = threshold_expensive_short
+    input_number.spot_price_cost_hot_water.raw_cost = raw_zone_hw
+    input_number.spot_price_cost_hot_water.lookahead_agreement = agreement_hw
+    input_number.spot_price_cost_hot_water.price_current = price_current
+
+    # --- BACKWARD COMPATIBILITY: Keep old combined indicator ---
     input_number.spot_price_cost.price_current = price_current
     input_number.spot_price_cost.price_average_short = price_average_short
     input_number.spot_price_cost.price_min_short = price_min_short
@@ -173,6 +330,7 @@ def updateSpotPriceSensors():
     input_number.spot_price_cost.price_25_percent_today = price_25_percent_today
     input_number.spot_price_cost.price_75_percent_today = price_75_percent_today
 
+    # Old combined cost calculation (kept for backward compatibility)
     cost_value = 0
     cost_value_addition = 0
 
