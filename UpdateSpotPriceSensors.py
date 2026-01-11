@@ -160,7 +160,10 @@ def _calculate_smoothed_cost(price_current, current_zone, thresholds, future_pri
 
     # Zone change detected - check if sustained
     future_zones = [_calculate_cost_for_price(p, *thresholds) for p in future_prices]
-    matching_count = sum(1 for z in future_zones if z == raw_zone)
+    matching_count = 0
+    for z in future_zones:
+        if z == raw_zone:
+            matching_count = matching_count + 1
     agreement = matching_count / len(future_zones)
 
     if agreement >= LOOKAHEAD_MAJORITY_THRESHOLD:
