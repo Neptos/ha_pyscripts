@@ -1660,13 +1660,15 @@ def calculateTeslaChargingSchedule():
     """Daily trigger to calculate optimal Tesla charging schedule.
 
     Runs at 15:00 daily (when tomorrow's Nordpool prices are available).
-    Checks preconditions and calculates the optimal charging schedule for
-    the next 24-36 hours.
+    Calculates the optimal charging schedule for the next 24-36 hours.
+
+    The schedule is calculated regardless of car location so it's ready
+    when the car arrives home. If SOC is unavailable (car not reachable),
+    the calculation will fail gracefully and be retried when the car
+    arrives home or cable is connected (via state triggers).
 
     Preconditions:
     - Smart charging must be enabled
-    - Car must be at home
-    - Charging cable must be connected
 
     The schedule is stored to HA entities and executed by executeTeslaChargingSchedule().
     """
@@ -1678,20 +1680,9 @@ def calculateTeslaChargingSchedule():
         _update_charging_status(0, "Smart charging disabled")
         return
 
-    # Check if car is at home
-    if not _is_car_at_home():
-        log.info("Car is not at home, skipping schedule calculation")
-        _update_charging_status(0, "Car not at home")
-        return
-
-    # Check if cable is connected
-    if not _is_cable_connected():
-        log.info("Charging cable not connected, skipping schedule calculation")
-        _update_charging_status(0, "Cable not connected")
-        return
-
-    # All preconditions met, calculate the schedule
-    log.info("Preconditions met, calculating charging schedule...")
+    # Calculate schedule - will fail gracefully if car not reachable (SOC unavailable)
+    # Schedule will be recalculated when car arrives home or cable is connected
+    log.info("Calculating charging schedule...")
 
     result = _calculate_and_store_schedule()
 
@@ -1797,6 +1788,26 @@ def executeTeslaChargingSchedule():
 # =============================================================================
 # STATE TRIGGERS - Replanning and Solar Opportunism
 # =============================================================================
+
+@state_trigger(f"{OUTPUT_SMART_CHARGING_ENABLED} == 'on'")
+def on_smart_charging_enabled():
+    """Trigger when smart charging is enabled.
+
+    Calculates a new charging schedule immediately so the user doesn't
+    have to wait until the next scheduled calculation (15:00).
+    """
+    log.info("Smart charging enabled - calculating schedule")
+
+    # Brief delay to ensure state is stable
+    task.sleep(2)
+
+    result = _calculate_and_store_schedule()
+
+    if result['success']:
+        log.info(f"Schedule calculated on enable: {result['message']}")
+    else:
+        log.warning(f"Schedule calculation on enable failed: {result['message']}")
+
 
 @state_trigger(f"{TESLA_LOCATION} == '{HOME_LOCATION}'")
 def on_car_arrives_home():
