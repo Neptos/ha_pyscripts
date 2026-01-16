@@ -26,7 +26,8 @@ Create these helpers in Home Assistant BEFORE deploying this script:
 
 2. input_text.tesla_charging_schedule
    - Maximum length: 255 characters
-   - Stores truncated JSON schedule; full schedule in status sensor attributes
+   - Human-readable schedule summary, e.g.: "3 slots: 23:30-00:15, 02:00-02:30 | 6.75 kWh | €0.42"
+   - Full JSON schedule available in input_number.tesla_charging_status attributes
 
 3. input_boolean.tesla_smart_charging_enabled
    - Master on/off toggle for smart charging
@@ -998,14 +999,58 @@ def _store_schedule(schedule_slots, mode="scheduled"):
         # Convert to JSON string
         schedule_json = json.dumps(schedule_data)
 
-        # Store in input_text (truncate if needed - HA limit is 255 chars)
-        # For the full schedule, we store it in attributes
-        truncated_json = schedule_json[:255] if len(schedule_json) > 255 else schedule_json
+        # Create human-readable summary for input_text (max 255 chars)
+        # Format: "3 slots: 23:30-00:15, 02:00-02:30 | 6.75 kWh | €0.42"
+        try:
+            if slots_json:
+                # Group consecutive slots into time ranges
+                time_ranges = []
+                range_start = None
+                range_end = None
+
+                for slot in slots_json:
+                    slot_start = datetime.fromisoformat(slot['start'])
+                    slot_end = datetime.fromisoformat(slot['end'])
+
+                    if range_start is None:
+                        range_start = slot_start
+                        range_end = slot_end
+                    elif slot_start == range_end:
+                        # Consecutive slot, extend the range
+                        range_end = slot_end
+                    else:
+                        # Gap found, save current range and start new one
+                        time_ranges.append((range_start, range_end))
+                        range_start = slot_start
+                        range_end = slot_end
+
+                # Don't forget the last range
+                if range_start is not None:
+                    time_ranges.append((range_start, range_end))
+
+                # Format time ranges
+                range_strs = []
+                for start, end in time_ranges:
+                    range_strs.append(f"{start.strftime('%H:%M')}-{end.strftime('%H:%M')}")
+
+                total_energy = schedule_data['total_energy_kwh']
+                est_cost = schedule_data['estimated_cost_eur']
+
+                summary = f"{len(slots_json)} slots: {', '.join(range_strs)} | {total_energy:.1f} kWh | €{est_cost:.2f}"
+
+                # Truncate if still too long (shouldn't happen often)
+                if len(summary) > 255:
+                    summary = summary[:252] + "..."
+            else:
+                summary = "No charging scheduled"
+        except Exception as e:
+            log.warning(f"Error creating schedule summary: {e}")
+            summary = f"{len(slots_json)} slots scheduled"
 
         try:
-            input_text.tesla_charging_schedule = truncated_json
+            input_text.tesla_charging_schedule = summary
         except Exception as e:
-            log.warning(f"Error storing truncated schedule to input_text: {e}")
+            log.warning(f"Error storing schedule summary to input_text: {e}")
 
         # Store full schedule and metadata as attributes on status sensor
         try:
@@ -1636,16 +1681,14 @@ def _calculate_target_amps_from_power(excess_watts):
     return max(MIN_CHARGE_AMPS, min(MAX_CHARGE_AMPS, target_amps))
 
 
-def _update_charging_schedule(schedule_data):
-    """Update the charging schedule output sensor.
+def _update_charging_schedule(message):
+    """Update the charging schedule output sensor with a status message.
 
     Args:
-        schedule_data: Dictionary containing schedule information
+        message: Human-readable status message (max 255 chars)
     """
     try:
-        schedule_json = json.dumps(schedule_data)
-        input_text.tesla_charging_schedule = schedule_json
-        input_text.tesla_charging_schedule.last_updated = datetime.now().isoformat()
+        input_text.tesla_charging_schedule = str(message)[:255]
     except Exception as e:
         log.warning(f"Error updating charging schedule: {e}")
 
@@ -2147,11 +2190,7 @@ def teslaSmartChargingTestService(action=None, id=None):
         log.warning(f"Error testing scheduling algorithm: {e}")
         # Fall back to simple status update
         _update_charging_status(0, "Test service executed")
-        _update_charging_schedule({
-            "test": True,
-            "timestamp": datetime.now().isoformat(),
-            "car_available": _is_car_at_home() and _is_cable_connected()
-        })
+        _update_charging_schedule("Test service - schedule calculation failed")
 
     # Test blended pricing functions
     try:
