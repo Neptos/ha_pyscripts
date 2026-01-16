@@ -984,7 +984,7 @@ def _store_schedule(schedule_slots, mode="scheduled"):
             'slot_count': len(slots_json),
             'solar_slots_count': solar_slots_count,
             'estimated_cost_eur': round(total_cost, 4),
-            'total_energy_kwh': round(sum(s['energy'] for s in schedule_slots), 2),
+            'total_energy_kwh': round(sum([s['energy'] for s in schedule_slots]), 2),
             'mode': mode,
             'last_calculated': now.isoformat(),
         }
@@ -1123,7 +1123,7 @@ def _calculate_and_store_schedule():
                 mandatory_energy_needed
             )
 
-            mandatory_energy_selected = sum(s['energy'] for s in mandatory_slots)
+            mandatory_energy_selected = sum([s['energy'] for s in mandatory_slots])
             log.info(f"Pass 1: Selected {len(mandatory_slots)} mandatory slots "
                      f"({mandatory_energy_selected:.2f} kWh)")
 
@@ -1146,7 +1146,7 @@ def _calculate_and_store_schedule():
         soc_after_mandatory = current_soc
         if mandatory_slots:
             # Estimate SOC after mandatory charging
-            mandatory_energy = sum(s['energy'] for s in mandatory_slots)
+            mandatory_energy = sum([s['energy'] for s in mandatory_slots])
             soc_delta = (mandatory_energy * CHARGING_EFFICIENCY / BATTERY_CAPACITY_KWH) * 100
             soc_after_mandatory = min(current_soc + soc_delta, charge_limit)
 
@@ -1171,7 +1171,7 @@ def _calculate_and_store_schedule():
                 optional_energy_needed
             )
 
-            optional_energy_selected = sum(s['energy'] for s in optional_slots)
+            optional_energy_selected = sum([s['energy'] for s in optional_slots])
             log.info(f"Pass 2: Selected {len(optional_slots)} optional slots "
                      f"({optional_energy_selected:.2f} kWh)")
         else:
@@ -1206,7 +1206,7 @@ def _calculate_and_store_schedule():
 
         # Update status
         total_slots = len(all_selected_slots)
-        total_energy = sum(s['energy'] for s in all_selected_slots)
+        total_energy = sum([s['energy'] for s in all_selected_slots])
         _update_charging_status(1, f"Scheduled: {total_slots} slots, {total_energy:.1f} kWh")
 
         # Log summary
