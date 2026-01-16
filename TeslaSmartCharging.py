@@ -77,8 +77,11 @@ Time Triggers:
   - cron(2,17,32,47 * * * *): Schedule execution every 15 minutes
 
 State Triggers:
+  - input_boolean.tesla_smart_charging_enabled == 'on': Smart charging enabled -> calculate
+  - binary_sensor.tesla_wall_connector_vehicle_connected == 'on': Wall connector detects
+      vehicle (instant, local) -> wake Tesla integration, calculate, stop auto-charge
   - device_tracker.location == 'home' : Car arrives home -> recalculate schedule
-  - binary_sensor.charge_cable == 'on': Cable connected -> recalculate schedule
+  - binary_sensor.charge_cable == 'on': Cable connected (cloud) -> recalculate schedule
   - sensor.power_meter_active_power   : Grid power change -> solar opportunism
 
 Services:
@@ -159,6 +162,9 @@ TESLA_CHARGING_STATE = "sensor.charging"
 TESLA_CHARGE_CABLE = "binary_sensor.charge_cable"
 TESLA_CHARGER_POWER = "sensor.charger_power"
 TESLA_CHARGE_LIMIT = "number.charge_limit"
+
+# --- Tesla Wall Connector (local, instant updates) ---
+WALL_CONNECTOR_VEHICLE = "binary_sensor.tesla_wall_connector_vehicle_connected"
 
 # --- Price Entities ---
 NORDPOOL_SENSOR = "sensor.nordpool_kwh_fi_eur_3_10_0"
@@ -1851,6 +1857,59 @@ def on_smart_charging_enabled():
         log.info(f"Schedule calculated on enable: {result['message']}")
     else:
         log.warning(f"Schedule calculation on enable failed: {result['message']}")
+
+
+@state_trigger(f"{WALL_CONNECTOR_VEHICLE} == 'on'")
+def on_wall_connector_vehicle_connected():
+    """Trigger when wall connector detects vehicle connection (instant, local).
+
+    The Tesla cloud integration is slow to update, but the wall connector
+    reports instantly via local API. This trigger:
+    1. Wakes the Tesla integration to get fresh data
+    2. Waits for sensors to update
+    3. Calculates schedule and stops auto-started charging if needed
+    """
+    log.info("Wall connector detected vehicle - waking Tesla integration")
+
+    # Check if smart charging is enabled first (quick check)
+    if not _is_smart_charging_enabled():
+        log.debug("Smart charging disabled, skipping wall connector trigger")
+        return
+
+    # Wake up Tesla integration by requesting entity updates
+    try:
+        # Update key entities to wake the car and get fresh data
+        service.call("homeassistant", "update_entity", entity_id=TESLA_BATTERY_LEVEL)
+        service.call("homeassistant", "update_entity", entity_id=TESLA_CHARGING_STATE)
+        service.call("homeassistant", "update_entity", entity_id=TESLA_CHARGE_CABLE)
+        log.info("Requested Tesla entity updates")
+    except Exception as e:
+        log.warning(f"Error requesting Tesla entity updates: {e}")
+
+    # Wait for Tesla integration to wake and report
+    task.sleep(30)
+
+    # Now proceed with schedule calculation
+    log.info("Calculating schedule after wall connector trigger")
+    result = _calculate_and_store_schedule()
+
+    if result['success']:
+        log.info(f"Schedule calculated via wall connector: {result['message']}")
+    else:
+        log.warning(f"Schedule calculation via wall connector failed: {result['message']}")
+
+    # Check if Tesla auto-started charging and stop if not in scheduled slot
+    task.sleep(10)
+
+    if _is_currently_charging():
+        if not _is_in_scheduled_slot():
+            # Tesla auto-starts charging when plugged in - stop it if not in slot
+            log.info("Stopping Tesla auto-started charging - not in scheduled slot")
+            _stop_charging()
+            _update_charging_status(4, "Auto-charge stopped - waiting for slot")
+        else:
+            log.info("Charging in scheduled slot - allowing")
+            state.setattr(OUTPUT_CHARGING_STATUS + ".charging_started_by", "smart_charging")
 
 
 @state_trigger(f"{TESLA_LOCATION} == '{HOME_LOCATION}'")
