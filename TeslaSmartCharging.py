@@ -970,7 +970,8 @@ def _store_schedule(schedule_slots, mode="scheduled"):
                 'energy': slot['energy'],
             }
             slots_json.append(slot_data)
-            total_cost += slot['effective_price'] * slot['energy']
+            # effective_price is in cents/kWh, energy in kWh, so divide by 100 for EUR
+            total_cost += (slot['effective_price'] * slot['energy']) / 100
 
             # Count slots with significant solar contribution
             if slot['solar_energy'] > 0.1:
