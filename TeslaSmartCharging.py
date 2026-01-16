@@ -1869,47 +1869,70 @@ def on_wall_connector_vehicle_connected():
     2. Waits for sensors to update
     3. Calculates schedule and stops auto-started charging if needed
     """
-    log.info("Wall connector detected vehicle - waking Tesla integration")
+    log.warning("=== WALL CONNECTOR TRIGGERED - Vehicle connected ===")
 
     # Check if smart charging is enabled first (quick check)
     if not _is_smart_charging_enabled():
-        log.debug("Smart charging disabled, skipping wall connector trigger")
+        log.warning("Smart charging disabled, skipping wall connector trigger")
         return
+
+    log.warning("Smart charging enabled, proceeding with wake-up sequence")
 
     # Wake up Tesla integration by requesting entity updates
     try:
         # Update key entities to wake the car and get fresh data
+        log.warning(f"Requesting update for {TESLA_BATTERY_LEVEL}")
         service.call("homeassistant", "update_entity", entity_id=TESLA_BATTERY_LEVEL)
+        log.warning(f"Requesting update for {TESLA_CHARGING_STATE}")
         service.call("homeassistant", "update_entity", entity_id=TESLA_CHARGING_STATE)
+        log.warning(f"Requesting update for {TESLA_CHARGE_CABLE}")
         service.call("homeassistant", "update_entity", entity_id=TESLA_CHARGE_CABLE)
-        log.info("Requested Tesla entity updates")
+        log.warning("Requested Tesla entity updates - waiting 60s for car to wake")
     except Exception as e:
         log.warning(f"Error requesting Tesla entity updates: {e}")
 
-    # Wait for Tesla integration to wake and report
-    task.sleep(30)
+    # Wait for Tesla integration to wake and report (increased from 30s)
+    task.sleep(60)
+
+    # Check if we have valid data now
+    soc = _get_current_soc()
+    log.warning(f"After 60s wait - SOC: {soc}")
+
+    if soc is None:
+        # Still no data, wait longer
+        log.warning("SOC still unavailable, waiting another 60s...")
+        task.sleep(60)
+        soc = _get_current_soc()
+        log.warning(f"After 120s total - SOC: {soc}")
 
     # Now proceed with schedule calculation
-    log.info("Calculating schedule after wall connector trigger")
+    log.warning("Calculating schedule after wall connector trigger")
     result = _calculate_and_store_schedule()
 
     if result['success']:
-        log.info(f"Schedule calculated via wall connector: {result['message']}")
+        log.warning(f"Schedule calculated via wall connector: {result['message']}")
     else:
         log.warning(f"Schedule calculation via wall connector failed: {result['message']}")
 
     # Check if Tesla auto-started charging and stop if not in scheduled slot
-    task.sleep(10)
+    log.warning("Waiting 15s before checking charging state...")
+    task.sleep(15)
 
-    if _is_currently_charging():
-        if not _is_in_scheduled_slot():
+    charging = _is_currently_charging()
+    in_slot = _is_in_scheduled_slot()
+    log.warning(f"Charging: {charging}, In scheduled slot: {in_slot}")
+
+    if charging:
+        if not in_slot:
             # Tesla auto-starts charging when plugged in - stop it if not in slot
-            log.info("Stopping Tesla auto-started charging - not in scheduled slot")
+            log.warning("Stopping Tesla auto-started charging - not in scheduled slot")
             _stop_charging()
             _update_charging_status(4, "Auto-charge stopped - waiting for slot")
         else:
-            log.info("Charging in scheduled slot - allowing")
+            log.warning("Charging in scheduled slot - allowing")
             state.setattr(OUTPUT_CHARGING_STATUS + ".charging_started_by", "smart_charging")
+    else:
+        log.warning("Car not charging - no action needed")
 
 
 @state_trigger(f"{TESLA_LOCATION} == '{HOME_LOCATION}'")
