@@ -134,8 +134,20 @@ def _evaluate_morning_guarantee(bt7, cheap_slots, pool):
     else:
         hours_until_morning = 6 - current_hour
 
-    # Project BT7 at 06:00
-    projected_bt7 = bt7 - (BT7_LOSS_RATE * hours_until_morning)
+    # Morning deadline
+    morning_target_time = now.replace(hour=6, minute=0, second=0, microsecond=0)
+    if current_hour >= 18:
+        morning_target_time += timedelta(days=1)
+
+    # Account for heating from cheap slots that fall before 06:00
+    cheap_heating_hours = 0
+    for slot in cheap_slots:
+        if slot['hour_start'] < morning_target_time and slot['hour_end'] > now:
+            cheap_heating_hours += 1
+    heating_from_cheap = cheap_heating_hours * 4 * HEATING_RATE_PER_15MIN
+
+    # Project BT7 at 06:00 (cooling minus expected heating from cheap slots)
+    projected_bt7 = bt7 - (BT7_LOSS_RATE * hours_until_morning) + heating_from_cheap
 
     if projected_bt7 >= BT7_MORNING_TARGET:
         return False, "not_needed"
@@ -151,11 +163,6 @@ def _evaluate_morning_guarantee(bt7, cheap_slots, pool):
     cheap_hour_starts = set()
     for slot in cheap_slots:
         cheap_hour_starts.add(slot['hour_start'])
-
-    # Morning deadline
-    morning_target_time = now.replace(hour=6, minute=0, second=0, microsecond=0)
-    if current_hour >= 18:
-        morning_target_time += timedelta(days=1)
 
     # Build available overnight 15-min intervals from non-cheap pool hours
     overnight_intervals = []
@@ -350,6 +357,40 @@ def _make_heating_decision():
     return 0, "default_block", debug
 
 
+@state_trigger("sensor.nibe_varmvatten_topp_bt7")
+def onBt7Change(**kwargs):
+    """React to BT7 changes for temperature safety layer only.
+
+    Only acts when the current optimizer reason is a temp_safety* reason,
+    so it never interferes with cheapest_3h, morning_guarantee, etc.
+    """
+    try:
+        attrs = state.getattr('input_number.hot_water_heating_status')
+        if not attrs:
+            return
+        current_reason = attrs.get('reason', '')
+        if not current_reason.startswith('temp_safety'):
+            return
+        current_status = float(state.get('input_number.hot_water_heating_status'))
+        if current_status < 0.5:
+            return
+    except:
+        return
+
+    try:
+        bt7 = float(state.get('sensor.nibe_varmvatten_topp_bt7'))
+    except:
+        return
+
+    if bt7 > BT7_SAFETY_HIGH:
+        now = datetime.now().astimezone()
+        input_number.hot_water_heating_status = 0
+        input_number.hot_water_heating_status.reason = "default_block"
+        input_number.hot_water_heating_status.last_calculated = now.isoformat()
+        input_number.hot_water_heating_status.last_decision_change = now.isoformat()
+        state.setattr('input_number.hot_water_heating_status.bt7_temperature', bt7)
+
+
 @service
 def hotWaterOptimizerTestService(action=None, id=None):
     """Service to manually trigger hot water optimizer."""
@@ -394,7 +435,25 @@ def updateHotWaterHeatingStatus():
                     reason = "cheapest_3h_stability"
                     # Preserve previous schedule for next stability check
                     debug['schedule_slots'] = prev_slots_str
+                    debug['schedule_source'] = attrs.get('schedule_source', 'unknown') if attrs else 'unknown'
                     break
+        except:
+            pass
+
+    # Stability rule: don't drop morning_guarantee mid-block on recalculation
+    if (current_status > 0.5
+            and current_reason in ('morning_guarantee', 'morning_guarantee_stability')
+            and status == 0):
+        try:
+            prev_mg_slot = attrs.get('morning_guarantee_slot', '') if attrs else ''
+            if ' - ' in prev_mg_slot:
+                mg_start_str, mg_end_str = prev_mg_slot.split(' - ')
+                mg_start = datetime.fromisoformat(mg_start_str.strip())
+                mg_end = datetime.fromisoformat(mg_end_str.strip())
+                if mg_start <= now < mg_end:
+                    status = 1
+                    reason = "morning_guarantee_stability"
+                    debug['morning_guarantee_slot'] = prev_mg_slot
         except:
             pass
 
