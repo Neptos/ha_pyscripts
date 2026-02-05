@@ -132,6 +132,9 @@ CHARGE_DEADLINE_HOUR = 7  # Deadline hour (7:00 AM)
 CHARGE_DEADLINE_MINUTE = 0  # Deadline minute
 MIN_CHANGE_INTERVAL_SECONDS = 300  # Minimum 5 minutes between charge adjustments
 
+# --- Cold Weather Buffer ---
+OUTDOOR_TEMP_SENSOR = "sensor.nibe_utetemperatur_bt1"  # Nibe heat pump outdoor temp
+
 # --- Solar Charging Parameters ---
 # Minimum charge power: 6A * 230V * 3 phases = 4140W
 MIN_CHARGE_POWER_W = MIN_CHARGE_AMPS * VOLTAGE * PHASES
@@ -1153,6 +1156,21 @@ def _calculate_and_store_schedule():
 
         if current_soc < MIN_SOC_GUARANTEE:
             mandatory_energy_needed = _calculate_kwh_needed(current_soc, MIN_SOC_GUARANTEE)
+
+            # Cold weather buffer: add extra energy for reduced charging rate during battery warm-up
+            try:
+                temp_state = state.get(OUTDOOR_TEMP_SENSOR)
+                temp = float(temp_state) if temp_state not in (None, 'unavailable', 'unknown') else None
+            except (ValueError, TypeError):
+                temp = None
+
+            extra_slots = 1 if temp is None else 2 if temp < -10 else 1 if temp < 0 else 0
+            if extra_slots > 0:
+                slot_energy = MAX_CHARGE_RATE_KW * 0.25  # kWh per 15-min slot
+                cold_weather_extra = extra_slots * slot_energy
+                mandatory_energy_needed += cold_weather_extra
+                log.info(f"Cold weather: {temp}°C -> +{extra_slots} slots ({cold_weather_extra:.2f} kWh)")
+
             log.info(f"Pass 1: Need {mandatory_energy_needed:.2f} kWh for mandatory charging "
                      f"({current_soc}% -> {MIN_SOC_GUARANTEE}%)")
 
