@@ -26,7 +26,7 @@ Create these helpers in Home Assistant BEFORE deploying this script:
 
 2. input_text.tesla_charging_schedule
    - Maximum length: 255 characters
-   - Human-readable schedule summary, e.g.: "3 slots: 23:30-00:15, 02:00-02:30 | 6.75 kWh | €0.42 | 6.2 c/kWh | →80%"
+   - Human-readable schedule summary, e.g.: "23:30-00:15, 02:00-02:30 | 6.75 kWh | €0.42 | 6.2 c/kWh | →80%"
    - Full JSON schedule available in input_number.tesla_charging_status attributes
 
 3. input_boolean.tesla_smart_charging_enabled
@@ -1038,7 +1038,7 @@ def _store_schedule(schedule_slots, mode="scheduled", current_soc=None):
         schedule_json = json.dumps(schedule_data)
 
         # Create human-readable summary for input_text (max 255 chars)
-        # Format: "3 slots: 23:30-00:15, 02:00-02:30 | 6.75 kWh | €0.42 | 6.2 c/kWh | →80%"
+        # Format: "23:30-00:15, 02:00-02:30 | 6.75 kWh | €0.42 | 6.2 c/kWh | →80%"
         try:
             if slots_json:
                 # Group consecutive slots into time ranges
@@ -1075,7 +1075,7 @@ def _store_schedule(schedule_slots, mode="scheduled", current_soc=None):
                 est_cost = schedule_data['estimated_cost_eur']
 
                 soc_str = f" | →{expected_soc}%" if expected_soc is not None else ""
-                summary = f"{len(slots_json)} slots: {', '.join(range_strs)} | {total_energy:.1f} kWh | €{est_cost:.2f} | {avg_price_c_kwh:.1f} c/kWh{soc_str}"
+                summary = f"{', '.join(range_strs)} | {total_energy:.1f} kWh | €{est_cost:.2f} | {avg_price_c_kwh:.1f} c/kWh{soc_str}"
 
                 # Truncate if still too long (shouldn't happen often)
                 if len(summary) > 255:
