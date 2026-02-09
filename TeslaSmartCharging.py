@@ -1262,8 +1262,8 @@ def _calculate_and_store_schedule():
 
             if max_avg_price > 0:
                 # Ceiling-aware selection: include mandatory slots in running average
-                mandatory_cost_sum = sum(s['effective_price'] * s['energy'] for s in mandatory_slots)
-                mandatory_energy_sum = sum(s['energy'] for s in mandatory_slots)
+                mandatory_cost_sum = sum([s['effective_price'] * s['energy'] for s in mandatory_slots])
+                mandatory_energy_sum = sum([s['energy'] for s in mandatory_slots])
 
                 running_cost_sum = mandatory_cost_sum
                 running_energy_sum = mandatory_energy_sum
@@ -1285,7 +1285,7 @@ def _calculate_and_store_schedule():
                     running_energy_sum = new_energy_sum
                     optional_energy_accumulated += slot['energy']
 
-                optional_energy_selected = sum(s['energy'] for s in optional_slots)
+                optional_energy_selected = sum([s['energy'] for s in optional_slots])
                 log.info(f"Pass 2: Selected {len(optional_slots)} optional slots "
                          f"({optional_energy_selected:.2f} kWh) with price ceiling {max_avg_price:.1f} c/kWh")
             else:
@@ -1295,7 +1295,7 @@ def _calculate_and_store_schedule():
                     optional_energy_needed
                 )
 
-                optional_energy_selected = sum(s['energy'] for s in optional_slots)
+                optional_energy_selected = sum([s['energy'] for s in optional_slots])
                 log.info(f"Pass 2: Selected {len(optional_slots)} optional slots "
                          f"({optional_energy_selected:.2f} kWh)")
         else:
