@@ -26,12 +26,20 @@ Create these helpers in Home Assistant BEFORE deploying this script:
 
 2. input_text.tesla_charging_schedule
    - Maximum length: 255 characters
-   - Human-readable schedule summary, e.g.: "3 slots: 23:30-00:15, 02:00-02:30 | 6.75 kWh | €0.42"
+   - Human-readable schedule summary, e.g.: "3 slots: 23:30-00:15, 02:00-02:30 | 6.75 kWh | €0.42 | 6.2 c/kWh"
    - Full JSON schedule available in input_number.tesla_charging_status attributes
 
 3. input_boolean.tesla_smart_charging_enabled
    - Master on/off toggle for smart charging
    - When off, all automation is disabled
+
+4. input_number.tesla_max_avg_price
+   - Minimum: 0
+   - Maximum: 30
+   - Step: 0.5
+   - Unit: c/kWh
+   - Set to 0 to disable price ceiling
+   - Only affects optional (Pass 2) slots. Mandatory 50% guarantee always completes.
 
 ================================================================================
 KEY FEATURES
@@ -191,6 +199,7 @@ SUN_NEXT_SETTING = "sensor.sun_next_setting"
 OUTPUT_CHARGING_STATUS = "input_number.tesla_charging_status"
 OUTPUT_CHARGING_SCHEDULE = "input_text.tesla_charging_schedule"
 OUTPUT_SMART_CHARGING_ENABLED = "input_boolean.tesla_smart_charging_enabled"
+OUTPUT_MAX_AVG_PRICE = "input_number.tesla_max_avg_price"
 
 
 # =============================================================================
@@ -965,6 +974,7 @@ def _store_schedule(schedule_slots, mode="scheduled"):
         # Convert slots to JSON-serializable format
         slots_json = []
         total_cost = 0.0
+        total_weighted_price = 0.0
         solar_slots_count = 0
 
         for slot in schedule_slots:
@@ -982,6 +992,7 @@ def _store_schedule(schedule_slots, mode="scheduled"):
             slots_json.append(slot_data)
             # effective_price is in cents/kWh, energy in kWh, so divide by 100 for EUR
             total_cost += (slot['effective_price'] * slot['energy']) / 100
+            total_weighted_price += slot['effective_price'] * slot['energy']
 
             # Count slots with significant solar contribution
             if slot['solar_energy'] > 0.1:
@@ -1001,6 +1012,11 @@ def _store_schedule(schedule_slots, mode="scheduled"):
             'last_calculated': now.isoformat(),
         }
 
+        # Calculate weighted average effective price (c/kWh)
+        total_energy = schedule_data['total_energy_kwh']
+        avg_price_c_kwh = round(total_weighted_price / total_energy, 1) if total_energy > 0 else 0.0
+        schedule_data['avg_price_c_kwh'] = avg_price_c_kwh
+
         # Find next slot start time
         if slots_json:
             # slots_json is now sorted by start time
@@ -1011,7 +1027,7 @@ def _store_schedule(schedule_slots, mode="scheduled"):
         schedule_json = json.dumps(schedule_data)
 
         # Create human-readable summary for input_text (max 255 chars)
-        # Format: "3 slots: 23:30-00:15, 02:00-02:30 | 6.75 kWh | €0.42"
+        # Format: "3 slots: 23:30-00:15, 02:00-02:30 | 6.75 kWh | €0.42 | 6.2 c/kWh"
         try:
             if slots_json:
                 # Group consecutive slots into time ranges
@@ -1047,7 +1063,7 @@ def _store_schedule(schedule_slots, mode="scheduled"):
                 total_energy = schedule_data['total_energy_kwh']
                 est_cost = schedule_data['estimated_cost_eur']
 
-                summary = f"{len(slots_json)} slots: {', '.join(range_strs)} | {total_energy:.1f} kWh | €{est_cost:.2f}"
+                summary = f"{len(slots_json)} slots: {', '.join(range_strs)} | {total_energy:.1f} kWh | €{est_cost:.2f} | {avg_price_c_kwh:.1f} c/kWh"
 
                 # Truncate if still too long (shouldn't happen often)
                 if len(summary) > 255:
@@ -1071,6 +1087,7 @@ def _store_schedule(schedule_slots, mode="scheduled"):
             state.setattr(OUTPUT_CHARGING_STATUS + ".estimated_cost_eur", round(total_cost, 4))
             state.setattr(OUTPUT_CHARGING_STATUS + ".last_calculated", now.isoformat())
             state.setattr(OUTPUT_CHARGING_STATUS + ".mode", mode)
+            state.setattr(OUTPUT_CHARGING_STATUS + ".avg_price_c_kwh", avg_price_c_kwh)
 
             if slots_json:
                 state.setattr(OUTPUT_CHARGING_STATUS + ".next_slot_start", slots_json[0]['start'])
@@ -1236,15 +1253,51 @@ def _calculate_and_store_schedule():
             # Sort by effective price
             remaining_slots.sort(key=lambda s: s['effective_price'])
 
-            # Select cheapest remaining slots
-            optional_slots = _select_slots_for_energy(
-                remaining_slots,
-                optional_energy_needed
-            )
+            # Read price ceiling for optional slots
+            try:
+                max_avg_price_raw = state.get(OUTPUT_MAX_AVG_PRICE)
+                max_avg_price = float(max_avg_price_raw) if max_avg_price_raw not in (None, 'unavailable', 'unknown') else 0.0
+            except (ValueError, TypeError):
+                max_avg_price = 0.0
 
-            optional_energy_selected = sum([s['energy'] for s in optional_slots])
-            log.info(f"Pass 2: Selected {len(optional_slots)} optional slots "
-                     f"({optional_energy_selected:.2f} kWh)")
+            if max_avg_price > 0:
+                # Ceiling-aware selection: include mandatory slots in running average
+                mandatory_cost_sum = sum(s['effective_price'] * s['energy'] for s in mandatory_slots)
+                mandatory_energy_sum = sum(s['energy'] for s in mandatory_slots)
+
+                running_cost_sum = mandatory_cost_sum
+                running_energy_sum = mandatory_energy_sum
+                optional_energy_accumulated = 0.0
+
+                for slot in remaining_slots:
+                    if optional_energy_accumulated >= optional_energy_needed:
+                        break
+                    # Check if adding this slot would push avg above ceiling
+                    new_cost_sum = running_cost_sum + slot['effective_price'] * slot['energy']
+                    new_energy_sum = running_energy_sum + slot['energy']
+                    new_avg = new_cost_sum / new_energy_sum if new_energy_sum > 0 else 0.0
+                    if new_avg > max_avg_price:
+                        log.info(f"Pass 2: Price ceiling {max_avg_price:.1f} c/kWh reached. "
+                                 f"Slot at {slot['effective_price']:.2f} c/kWh would push avg to {new_avg:.2f} c/kWh")
+                        break
+                    optional_slots.append(slot)
+                    running_cost_sum = new_cost_sum
+                    running_energy_sum = new_energy_sum
+                    optional_energy_accumulated += slot['energy']
+
+                optional_energy_selected = sum(s['energy'] for s in optional_slots)
+                log.info(f"Pass 2: Selected {len(optional_slots)} optional slots "
+                         f"({optional_energy_selected:.2f} kWh) with price ceiling {max_avg_price:.1f} c/kWh")
+            else:
+                # No ceiling - use original selection
+                optional_slots = _select_slots_for_energy(
+                    remaining_slots,
+                    optional_energy_needed
+                )
+
+                optional_energy_selected = sum(s['energy'] for s in optional_slots)
+                log.info(f"Pass 2: Selected {len(optional_slots)} optional slots "
+                         f"({optional_energy_selected:.2f} kWh)")
         else:
             log.info("Pass 2: Skipped - no optional charging needed")
 

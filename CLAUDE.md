@@ -86,3 +86,25 @@ Creates electricity cost indicators (0-3 scale) based on short-term (today+tomor
 **Helper Creation**: Input_number helpers cannot be reliably persisted when created via pyscript. Create them manually in HA UI before deploying scripts.
 
 **Deployment**: Copy `.py` files to Home Assistant's `config/pyscript/` directory.
+
+### TeslaSmartCharging.py
+Optimizes Tesla charging based on Nordpool spot prices and solar production forecasts.
+
+**Required Helpers** (create in HA UI before deploying):
+- `input_number.tesla_charging_status` - Status code + schedule attributes
+- `input_text.tesla_charging_schedule` - Human-readable schedule summary, e.g.: `"3 slots: 23:30-00:15, 02:00-02:30 | 6.75 kWh | €0.42 | 6.2 c/kWh"`
+- `input_boolean.tesla_smart_charging_enabled` - Master on/off toggle
+- `input_number.tesla_max_avg_price` - Price ceiling for average charging cost (c/kWh, 0-30, step 0.5). Set to 0 to disable. Only affects optional (Pass 2) slots — mandatory 50% guarantee always completes.
+
+**Key Features**:
+- Two-pass greedy algorithm: Pass 1 (mandatory) ensures 50% SOC by 7:00 AM, Pass 2 (optional) fills to charge limit
+- Solar-aware effective pricing (opportunity cost model)
+- Price ceiling control: limits optional charging slots to keep weighted average price below configured threshold
+- Solar opportunistic charging during daylight hours
+- 15-minute slot granularity matching Nordpool pricing
+
+**Schedule Attributes** (on `input_number.tesla_charging_status`):
+- `schedule_json` - Full JSON schedule with all slot details
+- `avg_price_c_kwh` - Energy-weighted average effective price (c/kWh)
+- `estimated_cost_eur` - Total estimated cost in EUR
+- `slot_count`, `solar_slots_count`, `mode`, `next_slot_start`, `schedule_end`
