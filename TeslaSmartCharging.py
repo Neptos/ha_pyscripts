@@ -26,7 +26,7 @@ Create these helpers in Home Assistant BEFORE deploying this script:
 
 2. input_text.tesla_charging_schedule
    - Maximum length: 255 characters
-   - Human-readable schedule summary, e.g.: "3 slots: 23:30-00:15, 02:00-02:30 | 6.75 kWh | €0.42 | 6.2 c/kWh"
+   - Human-readable schedule summary, e.g.: "3 slots: 23:30-00:15, 02:00-02:30 | 6.75 kWh | €0.42 | 6.2 c/kWh | →80%"
    - Full JSON schedule available in input_number.tesla_charging_status attributes
 
 3. input_boolean.tesla_smart_charging_enabled
@@ -958,7 +958,7 @@ def _select_slots_for_energy(slots, energy_needed):
     return selected
 
 
-def _store_schedule(schedule_slots, mode="scheduled"):
+def _store_schedule(schedule_slots, mode="scheduled", current_soc=None):
     """Store the charging schedule to Home Assistant entities.
 
     Stores the schedule as JSON in the input_text entity, with metadata
@@ -967,6 +967,7 @@ def _store_schedule(schedule_slots, mode="scheduled"):
     Args:
         schedule_slots: List of selected slot dictionaries
         mode: Charging mode string (e.g., "scheduled", "immediate", "solar")
+        current_soc: Current battery SOC (%) for calculating expected resulting SOC
     """
     try:
         now = datetime.now().astimezone()
@@ -1017,6 +1018,16 @@ def _store_schedule(schedule_slots, mode="scheduled"):
         avg_price_c_kwh = round(total_weighted_price / total_energy, 1) if total_energy > 0 else 0.0
         schedule_data['avg_price_c_kwh'] = avg_price_c_kwh
 
+        # Calculate expected resulting SOC after charging
+        expected_soc = None
+        if current_soc is not None and total_energy > 0:
+            energy_to_battery = total_energy * CHARGING_EFFICIENCY
+            soc_delta = (energy_to_battery / BATTERY_CAPACITY_KWH) * 100
+            expected_soc = min(round(current_soc + soc_delta), 100)
+        elif current_soc is not None:
+            expected_soc = round(current_soc)
+        schedule_data['expected_soc'] = expected_soc
+
         # Find next slot start time
         if slots_json:
             # slots_json is now sorted by start time
@@ -1027,7 +1038,7 @@ def _store_schedule(schedule_slots, mode="scheduled"):
         schedule_json = json.dumps(schedule_data)
 
         # Create human-readable summary for input_text (max 255 chars)
-        # Format: "3 slots: 23:30-00:15, 02:00-02:30 | 6.75 kWh | €0.42 | 6.2 c/kWh"
+        # Format: "3 slots: 23:30-00:15, 02:00-02:30 | 6.75 kWh | €0.42 | 6.2 c/kWh | →80%"
         try:
             if slots_json:
                 # Group consecutive slots into time ranges
@@ -1063,7 +1074,8 @@ def _store_schedule(schedule_slots, mode="scheduled"):
                 total_energy = schedule_data['total_energy_kwh']
                 est_cost = schedule_data['estimated_cost_eur']
 
-                summary = f"{len(slots_json)} slots: {', '.join(range_strs)} | {total_energy:.1f} kWh | €{est_cost:.2f} | {avg_price_c_kwh:.1f} c/kWh"
+                soc_str = f" | →{expected_soc}%" if expected_soc is not None else ""
+                summary = f"{len(slots_json)} slots: {', '.join(range_strs)} | {total_energy:.1f} kWh | €{est_cost:.2f} | {avg_price_c_kwh:.1f} c/kWh{soc_str}"
 
                 # Truncate if still too long (shouldn't happen often)
                 if len(summary) > 255:
@@ -1088,6 +1100,8 @@ def _store_schedule(schedule_slots, mode="scheduled"):
             state.setattr(OUTPUT_CHARGING_STATUS + ".last_calculated", now.isoformat())
             state.setattr(OUTPUT_CHARGING_STATUS + ".mode", mode)
             state.setattr(OUTPUT_CHARGING_STATUS + ".avg_price_c_kwh", avg_price_c_kwh)
+            if expected_soc is not None:
+                state.setattr(OUTPUT_CHARGING_STATUS + ".expected_soc", expected_soc)
 
             if slots_json:
                 state.setattr(OUTPUT_CHARGING_STATUS + ".next_slot_start", slots_json[0]['start'])
@@ -1141,7 +1155,7 @@ def _calculate_and_store_schedule():
         # Check if already at or above charge limit
         if current_soc >= charge_limit:
             log.info("Already at or above charge limit, no charging needed")
-            _store_schedule([], mode="complete")
+            _store_schedule([], mode="complete", current_soc=current_soc)
             _update_charging_status(5, "Target SOC reached")
             return {
                 'success': True,
@@ -1308,7 +1322,7 @@ def _calculate_and_store_schedule():
 
         if not all_selected_slots:
             log.info("No charging slots selected")
-            _store_schedule([], mode="idle")
+            _store_schedule([], mode="idle", current_soc=current_soc)
             _update_charging_status(0, "No charging needed")
             return {
                 'success': True,
@@ -1326,7 +1340,7 @@ def _calculate_and_store_schedule():
             mode = "scheduled_optional"
 
         # Store the schedule
-        _store_schedule(all_selected_slots, mode=mode)
+        _store_schedule(all_selected_slots, mode=mode, current_soc=current_soc)
 
         # Update status
         total_slots = len(all_selected_slots)
