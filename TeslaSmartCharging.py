@@ -106,7 +106,7 @@ entity IDs before deployment.
 ================================================================================
 """
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import json
 
 # =============================================================================
@@ -1437,6 +1437,12 @@ def _stop_charging():
 
     Turns off the charging switch. Does not modify the amperage setting.
 
+    Includes an ownership guard: if charging is currently owned by
+    'smart_charging' or 'solar_opportunistic', the ownership attribute
+    is preserved. This prevents delayed handler executions (from
+    on_wall_connector_vehicle_connected or on_cable_connected) from
+    clearing ownership of legitimately scheduled charging sessions.
+
     Returns:
         bool: True if command succeeded, False otherwise
     """
@@ -1445,8 +1451,19 @@ def _stop_charging():
 
         switch.turn_off(entity_id=TESLA_CHARGE_SWITCH)
 
-        # Record that we stopped charging
+        # Record stop time
         state.setattr(OUTPUT_CHARGING_STATUS + ".charging_stopped_at", datetime.now().isoformat())
+
+        # Only clear ownership if charging was auto-started or not owned.
+        # Do NOT clear if owned by smart_charging or solar_opportunistic,
+        # as a delayed handler may be calling this after the cron executor
+        # has already started legitimate scheduled charging.
+        attrs = state.getattr(OUTPUT_CHARGING_STATUS) or {}
+        current_owner = attrs.get("charging_started_by")
+        if current_owner in ["smart_charging", "solar_opportunistic"]:
+            log.warning(f"_stop_charging: skipping ownership clear - charging owned by {current_owner}")
+        else:
+            state.setattr(OUTPUT_CHARGING_STATUS + ".charging_started_by", "none")
 
         return True
 
@@ -1493,15 +1510,115 @@ def _is_currently_charging():
     """Check if the Tesla is currently charging.
 
     Returns:
-        bool: True if actively charging, False otherwise
+        bool: True if actively charging, False otherwise.
+              Warning logged if charging state data is stale (>60s old).
     """
     try:
+        # Warn if charging state data is stale (may be unreliable)
+        if not _is_entity_fresh(TESLA_CHARGING_STATE, max_age_seconds=60):
+            log.warning(
+                f"Charging state may be unreliable: {TESLA_CHARGING_STATE} data is stale"
+            )
+
         charging_state = state.get(TESLA_CHARGING_STATE)
         # Tesla integration uses lowercase states: "charging", "stopped", "disconnected", etc.
         return charging_state is not None and charging_state.lower() == "charging"
     except Exception as e:
         log.warning(f"Error checking charging state: {e}")
         return False
+
+
+def _is_entity_fresh(entity_id, max_age_seconds=15):
+    """Check if entity data is fresh (recently updated).
+
+    When Tesla Fleet integration has errors, entities stop updating and
+    show stale data. This function checks the last_updated timestamp to
+    detect staleness.
+
+    Args:
+        entity_id: Entity to check (e.g., "sensor.charging")
+        max_age_seconds: Maximum age in seconds to consider fresh
+
+    Returns:
+        bool: True if entity was updated within max_age_seconds
+    """
+    try:
+        # Access last_updated virtual attribute via pyscript's state.get()
+        last_updated = state.get(f"{entity_id}.last_updated")
+
+        if last_updated is None:
+            log.warning(f"Could not get last_updated for {entity_id}")
+            return False
+
+        # Calculate age in seconds using UTC for consistent comparison
+        now = datetime.now(tz=timezone.utc)
+
+        # Ensure last_updated is timezone-aware
+        if last_updated.tzinfo is None:
+            log.warning(f"last_updated for {entity_id} is not timezone-aware")
+            return False
+
+        age_seconds = (now - last_updated).total_seconds()
+
+        is_fresh = age_seconds <= max_age_seconds
+        if not is_fresh:
+            log.warning(f"{entity_id} data is stale: {age_seconds:.1f}s old")
+
+        return is_fresh
+
+    except Exception as e:
+        log.warning(f"Error checking freshness for {entity_id}: {e}")
+        return False
+
+
+def _force_refresh_tesla_state_with_retry(max_attempts=3):
+    """Force Tesla entity updates with retry logic.
+
+    When Tesla Fleet integration has IndexErrors, entity updates fail.
+    This function retries with exponential backoff to give the integration
+    time to recover.
+
+    Args:
+        max_attempts: Maximum number of retry attempts (default 3)
+
+    Returns:
+        bool: True if fresh data obtained, False if all retries failed
+    """
+    wait_times = [15, 45, 90]  # Backoff for sleeping Tesla: 15s, 45s, 90s
+
+    for attempt in range(max_attempts):
+        try:
+            log.info(f"Refreshing Tesla state (attempt {attempt + 1}/{max_attempts})")
+
+            # Force entity updates
+            service.call("homeassistant", "update_entity", entity_id=TESLA_CHARGING_STATE)
+            service.call("homeassistant", "update_entity", entity_id=TESLA_CHARGE_SWITCH)
+            service.call("homeassistant", "update_entity", entity_id=TESLA_CHARGE_CABLE)
+
+            # Wait for update to complete
+            wait_time = wait_times[attempt] if attempt < len(wait_times) else wait_times[-1]
+            log.debug(f"Waiting {wait_time}s for entity updates...")
+            task.sleep(wait_time)
+
+            # Verify freshness - use wait_time + 5s as max age to account for processing delay
+            max_age = wait_time + 5
+            charging_state_fresh = _is_entity_fresh(TESLA_CHARGING_STATE, max_age_seconds=max_age)
+            switch_state_fresh = _is_entity_fresh(TESLA_CHARGE_SWITCH, max_age_seconds=max_age)
+
+            if charging_state_fresh and switch_state_fresh:
+                log.info(f"Successfully refreshed Tesla state on attempt {attempt + 1}")
+                return True
+            elif charging_state_fresh or switch_state_fresh:
+                log.warning(f"Partial freshness on attempt {attempt + 1} - charging_state: {charging_state_fresh}, switch: {switch_state_fresh}")
+                # Fall through to retry
+            else:
+                log.warning(f"Tesla state still stale after attempt {attempt + 1}")
+
+        except Exception as e:
+            log.warning(f"Error during refresh attempt {attempt + 1}: {e}")
+
+    log.error(f"Failed to refresh Tesla state after {max_attempts} attempts")
+    return False
 
 
 def _was_charging_started_by_us():
@@ -1750,6 +1867,7 @@ def _stop_solar_opportunistic_charging():
         switch.turn_off(entity_id=TESLA_CHARGE_SWITCH)
 
         state.setattr(OUTPUT_CHARGING_STATUS + ".charging_stopped_at", datetime.now().isoformat())
+        state.setattr(OUTPUT_CHARGING_STATUS + ".charging_started_by", "none")
         _set_last_solar_change_time()
 
         return True
@@ -1953,14 +2071,27 @@ def on_wall_connector_vehicle_connected():
     The Tesla cloud integration is slow to update, but the wall connector
     reports instantly via local API. This trigger:
     1. Wakes the Tesla integration to get fresh data
-    2. Waits for sensors to update
-    3. Calculates schedule and stops auto-started charging if needed
+    2. Recalculates the charging schedule
+    3. Stops any Tesla auto-started charging if we're outside a scheduled slot
+
+    Uses staleness detection with retry to ensure we have fresh data
+    before making stop/allow decisions. Falls back to fail-safe stop
+    if fresh data cannot be obtained.
+
+    All critical operations are wrapped in try/except to ensure that
+    exceptions never prevent the stop command from being issued.
     """
     log.info("Wall connector detected vehicle - waking Tesla integration")
 
     # Check if smart charging is enabled first (quick check)
     if not _is_smart_charging_enabled():
         log.debug("Smart charging disabled, skipping wall connector trigger")
+        return
+
+    # SAFETY: Verify car is at home before controlling charging
+    # Even though wall connector is at home, add explicit check for safety
+    if not _is_car_at_home():
+        log.warning("Wall connector triggered but car location shows not home - skipping")
         return
 
     # Wake up Tesla integration by requesting entity updates
@@ -1975,6 +2106,11 @@ def on_wall_connector_vehicle_connected():
     # Wait for Tesla integration to wake and report
     task.sleep(45)
 
+    # Check if cable still connected after wake
+    if not _is_cable_connected():
+        log.warning("Cable disconnected during wall connector wake sequence - aborting")
+        return
+
     # Check if we have valid data now
     soc = _get_current_soc()
     if soc is None:
@@ -1982,26 +2118,72 @@ def on_wall_connector_vehicle_connected():
         log.debug("SOC unavailable, waiting another 30s...")
         task.sleep(30)
 
-    # Now proceed with schedule calculation
-    result = _calculate_and_store_schedule()
+        # Check if cable still connected after SOC wait
+        if not _is_cable_connected():
+            log.warning("Cable disconnected during SOC wait - aborting")
+            return
 
-    if result['success']:
-        log.info(f"Schedule calculated via wall connector: {result['message']}")
-    else:
-        log.warning(f"Schedule calculation via wall connector failed: {result['message']}")
+    # Now proceed with schedule calculation (with exception safety)
+    try:
+        result = _calculate_and_store_schedule()
+        if result['success']:
+            log.info(f"Schedule calculated via wall connector: {result['message']}")
+        else:
+            log.warning(f"Schedule calculation via wall connector failed: {result['message']}")
+    except Exception as e:
+        log.error(f"Exception during schedule calculation: {e}")
+        # Continue anyway - refresh and stop logic still needed
 
     # Check if Tesla auto-started charging and stop if not in scheduled slot
     task.sleep(5)
 
-    if _is_currently_charging():
-        if not _is_in_scheduled_slot():
-            # Tesla auto-starts charging when plugged in - stop it if not in slot
-            log.info("Stopping Tesla auto-started charging - not in scheduled slot")
+    # Check if cable still connected before refresh retry
+    if not _is_cable_connected():
+        log.warning("Cable disconnected before refresh retry - aborting")
+        return
+
+    # Force fresh data with retry (CRITICAL for detecting auto-start)
+    data_is_fresh = False
+    try:
+        data_is_fresh = _force_refresh_tesla_state_with_retry(max_attempts=3)
+    except Exception as e:
+        log.error(f"Exception during refresh: {e}")
+        data_is_fresh = False
+
+    if not data_is_fresh:
+        # Fail-safe: Data is stale, stop charging unconditionally
+        # Safety over optimization - if we can't verify car state, default to stopping.
+        # The cron executor will start charging during valid slots once Tesla Fleet recovers.
+        log.warning("Fail-safe: cannot verify Tesla state, stopping charging regardless of schedule")
+        try:
             _stop_charging()
-            _update_charging_status(4, "Auto-charge stopped - waiting for slot")
-        else:
-            log.debug("Charging in scheduled slot - allowing")
-            state.setattr(OUTPUT_CHARGING_STATUS + ".charging_started_by", "smart_charging")
+        except Exception as e:
+            log.error(f"Fail-safe stop failed: {e}")
+        return
+
+    # Check if cable still connected after refresh
+    if not _is_cable_connected():
+        log.warning("Cable disconnected during refresh retry - aborting")
+        return
+
+    # Now check with fresh data (with exception safety)
+    try:
+        if _is_currently_charging():
+            if not _is_in_scheduled_slot():
+                # Tesla auto-starts charging when plugged in - stop it unconditionally
+                log.info("Stopping Tesla auto-started charging - not in scheduled slot")
+                if not _stop_charging():
+                    log.error("Stop charging command failed")
+                _update_charging_status(4, "Auto-charge stopped - waiting for slot")
+            else:
+                log.debug("Charging in scheduled slot - allowing")
+                state.setattr(OUTPUT_CHARGING_STATUS + ".charging_started_by", "smart_charging")
+    except Exception as e:
+        log.error(f"Exception in charging check: {e} - attempting emergency stop")
+        try:
+            _stop_charging()
+        except Exception as e2:
+            log.error(f"Emergency stop failed: {e2}")
 
 
 @state_trigger(f"{TESLA_LOCATION} == '{HOME_LOCATION}'")
@@ -2041,50 +2223,94 @@ def on_cable_connected():
     """Trigger when charging cable is connected.
 
     Calculates a new charging schedule and stops any auto-started
-    charging if we're not in a scheduled slot (Tesla sometimes
-    auto-starts charging when cable is connected).
-    """
-    log.info("Charging cable connected - checking for schedule calculation")
+    charging if we're not in a scheduled slot. Tesla auto-starts
+    charging when cable is connected, and we must stop it unconditionally
+    if outside a scheduled slot.
 
-    # Wait briefly for state to stabilize
-    task.sleep(5)
+    Uses staleness detection with retry to ensure we have fresh data
+    before making stop/allow decisions. Falls back to fail-safe stop
+    if fresh data cannot be obtained.
+
+    All critical operations are wrapped in try/except to ensure that
+    exceptions never prevent the stop command from being issued.
+    """
+    log.info("Charging cable connected")
 
     # Check if smart charging is enabled
     if not _is_smart_charging_enabled():
-        log.debug("Smart charging disabled, skipping schedule on cable connect")
+        log.debug("Smart charging disabled, skipping cable connected handler")
         return
+
+    # Wait briefly for things to settle
+    task.sleep(5)
 
     # Check if car is at home
     if not _is_car_at_home():
-        log.info("Car not at home when cable connected, skipping schedule")
+        log.debug("Car not at home")
         return
 
-    # Calculate and store a new schedule
-    log.info("Calculating new charging schedule after cable connection")
-    result = _calculate_and_store_schedule()
+    # Calculate schedule (with exception safety)
+    log.info("Calculating charging schedule after cable connection")
+    try:
+        result = _calculate_and_store_schedule()
+        if result['success']:
+            log.info(f"Schedule calculated: {result['message']}")
+        else:
+            log.warning(f"Schedule calculation failed: {result['message']}")
+    except Exception as e:
+        log.error(f"Exception during schedule calculation: {e}")
+        # Continue anyway - refresh and stop logic still needed
 
-    if result['success']:
-        log.info(f"Schedule calculated on cable connect: {result['message']}")
-    else:
-        log.warning(f"Schedule calculation on cable connect failed: {result['message']}")
+    # Wait a bit more for Tesla to potentially auto-start charging
+    task.sleep(10)
 
-    # Check if Tesla auto-started charging
-    task.sleep(10)  # Wait for charging state to update
+    # Early exit if cable disconnected during waits
+    if not _is_cable_connected():
+        log.info("Cable disconnected during handler - aborting")
+        return
 
-    if _is_currently_charging():
-        # Check if we're in a scheduled slot
-        if not _is_in_scheduled_slot():
-            # Only stop if WE started the charging (not user/Tesla app)
-            if _was_charging_started_by_us():
-                log.info("Stopping our auto-started charging - not in scheduled slot")
-                _stop_charging()
+    # Force fresh data with retry (CRITICAL for detecting auto-start)
+    data_is_fresh = False
+    try:
+        data_is_fresh = _force_refresh_tesla_state_with_retry(max_attempts=3)
+    except Exception as e:
+        log.error(f"Exception during refresh: {e}")
+        data_is_fresh = False
+
+    if not data_is_fresh:
+        # Fail-safe: Data is stale, stop charging unconditionally
+        # Safety over optimization - if we can't verify car state, default to stopping.
+        # The cron executor will start charging during valid slots once Tesla Fleet recovers.
+        log.warning("Fail-safe: cannot verify Tesla state, stopping charging regardless of schedule")
+        try:
+            _stop_charging()
+        except Exception as e:
+            log.error(f"Fail-safe stop failed: {e}")
+        return
+
+    # Early exit if cable disconnected during refresh attempts
+    if not _is_cable_connected():
+        log.info("Cable disconnected during refresh - aborting")
+        return
+
+    # Now check with fresh data (with exception safety)
+    try:
+        if _is_currently_charging():
+            if not _is_in_scheduled_slot():
+                # Tesla auto-starts when plugged in - stop it unconditionally
+                log.info("Stopping auto-started charging - not in scheduled slot")
+                if not _stop_charging():
+                    log.error("Stop charging command failed")
                 _update_charging_status(4, "Auto-charge stopped - waiting for slot")
             else:
-                log.info("Charging started by user/Tesla - not interfering")
-        else:
-            log.info("Tesla started charging and we're in a scheduled slot - allowing")
-            # Mark that smart charging is managing this
-            state.setattr(OUTPUT_CHARGING_STATUS + ".charging_started_by", "smart_charging")
+                log.info("Charging in scheduled slot - allowing")
+                state.setattr(OUTPUT_CHARGING_STATUS + ".charging_started_by", "smart_charging")
+    except Exception as e:
+        log.error(f"Exception in charging check: {e} - attempting emergency stop")
+        try:
+            _stop_charging()
+        except Exception as e2:
+            log.error(f"Emergency stop failed: {e2}")
 
 
 @state_trigger(f"{GRID_POWER_CURRENT}")
