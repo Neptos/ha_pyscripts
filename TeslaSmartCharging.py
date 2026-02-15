@@ -2043,6 +2043,12 @@ def on_smart_charging_enabled():
     else:
         log.warning(f"Schedule calculation on enable failed: {result['message']}")
 
+    # Stop charging if currently charging outside a scheduled slot
+    if _is_currently_charging() and not _is_in_scheduled_slot():
+        log.info("Stopping charging - not in scheduled slot after re-enable")
+        _stop_charging()
+        _update_charging_status(4, "Stopped - waiting for slot")
+
 
 @state_trigger(f"{WALL_CONNECTOR_VEHICLE} == 'on'")
 def on_wall_connector_vehicle_connected():
