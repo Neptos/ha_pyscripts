@@ -1600,8 +1600,10 @@ def _force_refresh_tesla_state_with_retry(max_attempts=3):
             log.debug(f"Waiting {wait_time}s for entity updates...")
             task.sleep(wait_time)
 
-            # Verify freshness - use wait_time + 5s as max age to account for processing delay
-            max_age = wait_time + 5
+            # Check if data is recent enough to be reliable.
+            # Tesla Fleet polls every ~60-90s and last_updated may not refresh
+            # if the state value is unchanged, so use a generous threshold.
+            max_age = 120
             charging_state_fresh = _is_entity_fresh(TESLA_CHARGING_STATE, max_age_seconds=max_age)
             switch_state_fresh = _is_entity_fresh(TESLA_CHARGE_SWITCH, max_age_seconds=max_age)
 
