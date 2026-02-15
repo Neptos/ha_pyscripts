@@ -649,10 +649,12 @@ def _get_solar_forecast_for_slot(slot_start):
 
         if slot_date == today:
             # Use remaining production for today
-            daily_forecast_kwh = float(state.get(SOLAR_REMAINING_TODAY) or 0)
+            raw = state.get(SOLAR_REMAINING_TODAY)
+            daily_forecast_kwh = float(raw) if raw not in (None, 'unavailable', 'unknown') else 0.0
         elif slot_date == today + timedelta(days=1):
             # Use tomorrow's full forecast
-            daily_forecast_kwh = float(state.get(SOLAR_PRODUCTION_TOMORROW) or 0)
+            raw = state.get(SOLAR_PRODUCTION_TOMORROW)
+            daily_forecast_kwh = float(raw) if raw not in (None, 'unavailable', 'unknown') else 0.0
         else:
             # No forecast available for this date
             return 0.0
