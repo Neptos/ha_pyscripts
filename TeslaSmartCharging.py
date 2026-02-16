@@ -1001,8 +1001,6 @@ def _consolidate_slots(selected_slots, all_slots, deadline, mandatory_starts):
         for group in groups:
             if group is target_group:
                 continue
-            if len(group) < 1:
-                continue
             # Slot just before the group
             before = min(group) - timedelta(minutes=15)
             # Slot just after the group
@@ -1020,66 +1018,41 @@ def _consolidate_slots(selected_slots, all_slots, deadline, mandatory_starts):
         candidates.sort(key=lambda s: s['effective_price'])
         return candidates[0]
 
-    # --- Pass 1: Relocate singles ---
-    groups = _group_consecutive(selected_starts)
-    singles = [g for g in groups if len(g) == 1]
-    large_groups = [g for g in groups if len(g) >= 2]
-
-    for single_group in singles:
-        if not large_groups:
+    # Iteratively relocate slots from small groups to be adjacent to larger ones.
+    # Re-groups after each swap so orphaned singles (e.g. from broken pairs) get handled.
+    for _ in range(len(selected_starts)):
+        groups = _group_consecutive(selected_starts)
+        if len(groups) <= 1:
             break
-        single_start = single_group[0]
-        is_mandatory = single_start in mandatory_starts
-        replacement = _find_adjacent_unselected(large_groups, single_group, is_mandatory)
-        if replacement is None:
-            continue
-        # Only swap if replacement is not more expensive (allow equal or cheaper)
-        single_slot = slot_lookup[single_start]
-        if replacement['effective_price'] > single_slot['effective_price'] * 2:
-            continue  # Don't swap if replacement is vastly more expensive
-        # Swap: deselect single, select replacement
-        selected_starts.discard(single_start)
-        selected_starts.add(replacement['start'])
-        if is_mandatory:
-            mandatory_starts.discard(single_start)
-            mandatory_starts.add(replacement['start'])
-        # Update the group that gained a member
-        for g in large_groups:
-            adj_before = min(g) - timedelta(minutes=15)
-            adj_after = max(g) + timedelta(minutes=15)
-            if replacement['start'] in (adj_before, adj_after):
-                g.append(replacement['start'])
-                g.sort()
+
+        # Process smallest groups first
+        groups.sort(key=len)
+
+        swapped = False
+        for target_group in groups:
+            # Only relocate singles and pairs (< 3 slots)
+            if len(target_group) >= 3:
+                continue
+            for slot_start in list(target_group):
+                is_mandatory = slot_start in mandatory_starts
+                replacement = _find_adjacent_unselected(groups, target_group, is_mandatory)
+                if replacement is None:
+                    continue
+                slot_obj = slot_lookup[slot_start]
+                if replacement['effective_price'] > slot_obj['effective_price'] * 2:
+                    continue
+                # Swap: deselect original, select replacement
+                selected_starts.discard(slot_start)
+                selected_starts.add(replacement['start'])
+                if is_mandatory:
+                    mandatory_starts.discard(slot_start)
+                    mandatory_starts.add(replacement['start'])
+                swapped = True
+                break
+            if swapped:
                 break
 
-    # --- Pass 2: Relocate pairs ---
-    groups = _group_consecutive(selected_starts)
-    pairs = [g for g in groups if len(g) == 2]
-
-    for pair in pairs:
-        # Find adjacent slots on any other group (any size)
-        for slot_start in list(pair):
-            is_mandatory = slot_start in mandatory_starts
-            replacement = _find_adjacent_unselected(groups, pair, is_mandatory)
-            if replacement is None:
-                continue
-            slot_obj = slot_lookup[slot_start]
-            if replacement['effective_price'] > slot_obj['effective_price'] * 2:
-                continue
-            selected_starts.discard(slot_start)
-            selected_starts.add(replacement['start'])
-            if is_mandatory:
-                mandatory_starts.discard(slot_start)
-                mandatory_starts.add(replacement['start'])
-            # Update the group that gained a member
-            for g in groups:
-                adj_before = min(g) - timedelta(minutes=15)
-                adj_after = max(g) + timedelta(minutes=15)
-                if replacement['start'] in (adj_before, adj_after):
-                    g.append(replacement['start'])
-                    g.sort()
-                    break
-            # Re-evaluate: the pair shrunk, stop processing it
+        if not swapped:
             break
 
     # Rebuild selected slots list from updated starts
