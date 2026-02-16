@@ -26,7 +26,7 @@ Create these helpers in Home Assistant BEFORE deploying this script:
 
 2. input_text.tesla_charging_schedule
    - Maximum length: 255 characters
-   - Human-readable schedule summary, e.g.: "23:30-00:15, 02:00-02:30 | 6.75 kWh | €0.42 | 6.2 c/kWh | →80%"
+   - Human-readable schedule summary, e.g.: "→80% | 6.75 kWh | €0.42 | 6.2 c/kWh | 23:30-00:15, 02:00-02:30"
    - Full JSON schedule available in input_number.tesla_charging_status attributes
 
 3. input_boolean.tesla_smart_charging_enabled
@@ -957,6 +957,170 @@ def _select_slots_for_energy(slots, energy_needed):
     return selected
 
 
+def _consolidate_slots(selected_slots, all_slots, deadline, mandatory_starts):
+    """Relocate isolated slot groups to be adjacent to larger groups.
+
+    Reduces start/stop cycles by moving singles next to groups of 2+,
+    and pairs next to any other group. Mandatory slots (by start time)
+    are only relocated to slots before the deadline.
+
+    Args:
+        selected_slots: List of currently selected slot dicts
+        all_slots: List of all available slot dicts
+        deadline: datetime, mandatory slots must stay before this
+        mandatory_starts: Set of start datetimes identifying mandatory slots
+            (mutated: updated when mandatory slots are relocated)
+
+    Returns:
+        list: Consolidated list of selected slots (same count)
+    """
+    if len(selected_slots) <= 1:
+        return list(selected_slots)
+
+    selected_starts = {s['start'] for s in selected_slots}
+    # Build lookup from start time to slot dict (from all_slots)
+    slot_lookup = {s['start']: s for s in all_slots}
+
+    def _group_consecutive(starts):
+        """Group start times into consecutive runs (15-min apart)."""
+        sorted_starts = sorted(starts)
+        groups = []
+        current_group = [sorted_starts[0]]
+        for i in range(1, len(sorted_starts)):
+            if sorted_starts[i] - sorted_starts[i - 1] == timedelta(minutes=15):
+                current_group.append(sorted_starts[i])
+            else:
+                groups.append(current_group)
+                current_group = [sorted_starts[i]]
+        groups.append(current_group)
+        return groups
+
+    def _find_adjacent_unselected(groups, target_group, is_mandatory):
+        """Find cheapest unselected slot adjacent to any group other than target_group."""
+        candidates = []
+        for group in groups:
+            if group is target_group:
+                continue
+            if len(group) < 1:
+                continue
+            # Slot just before the group
+            before = min(group) - timedelta(minutes=15)
+            # Slot just after the group
+            after = max(group) + timedelta(minutes=15)
+            for adj_start in [before, after]:
+                if adj_start in selected_starts:
+                    continue  # Already selected
+                if adj_start not in slot_lookup:
+                    continue  # Not an available slot
+                if is_mandatory and adj_start >= deadline:
+                    continue  # Mandatory must stay before deadline
+                candidates.append(slot_lookup[adj_start])
+        if not candidates:
+            return None
+        candidates.sort(key=lambda s: s['effective_price'])
+        return candidates[0]
+
+    # --- Pass 1: Relocate singles ---
+    groups = _group_consecutive(selected_starts)
+    singles = [g for g in groups if len(g) == 1]
+    large_groups = [g for g in groups if len(g) >= 2]
+
+    for single_group in singles:
+        if not large_groups:
+            break
+        single_start = single_group[0]
+        is_mandatory = single_start in mandatory_starts
+        replacement = _find_adjacent_unselected(large_groups, single_group, is_mandatory)
+        if replacement is None:
+            continue
+        # Only swap if replacement is not more expensive (allow equal or cheaper)
+        single_slot = slot_lookup[single_start]
+        if replacement['effective_price'] > single_slot['effective_price'] * 2:
+            continue  # Don't swap if replacement is vastly more expensive
+        # Swap: deselect single, select replacement
+        selected_starts.discard(single_start)
+        selected_starts.add(replacement['start'])
+        if is_mandatory:
+            mandatory_starts.discard(single_start)
+            mandatory_starts.add(replacement['start'])
+        # Update the group that gained a member
+        for g in large_groups:
+            adj_before = min(g) - timedelta(minutes=15)
+            adj_after = max(g) + timedelta(minutes=15)
+            if replacement['start'] in (adj_before, adj_after):
+                g.append(replacement['start'])
+                g.sort()
+                break
+
+    # --- Pass 2: Relocate pairs ---
+    groups = _group_consecutive(selected_starts)
+    pairs = [g for g in groups if len(g) == 2]
+
+    for pair in pairs:
+        # Find adjacent slots on any other group (any size)
+        for slot_start in list(pair):
+            is_mandatory = slot_start in mandatory_starts
+            replacement = _find_adjacent_unselected(groups, pair, is_mandatory)
+            if replacement is None:
+                continue
+            slot_obj = slot_lookup[slot_start]
+            if replacement['effective_price'] > slot_obj['effective_price'] * 2:
+                continue
+            selected_starts.discard(slot_start)
+            selected_starts.add(replacement['start'])
+            if is_mandatory:
+                mandatory_starts.discard(slot_start)
+                mandatory_starts.add(replacement['start'])
+            # Update the group that gained a member
+            for g in groups:
+                adj_before = min(g) - timedelta(minutes=15)
+                adj_after = max(g) + timedelta(minutes=15)
+                if replacement['start'] in (adj_before, adj_after):
+                    g.append(replacement['start'])
+                    g.sort()
+                    break
+            # Re-evaluate: the pair shrunk, stop processing it
+            break
+
+    # Rebuild selected slots list from updated starts
+    result = [slot_lookup[s] for s in selected_starts if s in slot_lookup]
+    result.sort(key=lambda s: s['start'])
+    return result
+
+
+def _apply_price_ceiling(mandatory_slots, optional_slots, max_avg_price):
+    """Drop most expensive optional slots until weighted avg price <= max_avg_price.
+
+    Args:
+        mandatory_slots: List of mandatory slot dicts (never dropped)
+        optional_slots: List of optional slot dicts (may be dropped)
+        max_avg_price: Price ceiling in c/kWh
+
+    Returns:
+        list: Filtered optional slots
+    """
+    if not optional_slots:
+        return []
+
+    # Sort optional by effective_price descending (most expensive first for dropping)
+    optional = sorted(optional_slots, key=lambda s: s['effective_price'], reverse=True)
+
+    mandatory_cost = sum([s['effective_price'] * s['energy'] for s in mandatory_slots])
+    mandatory_energy = sum([s['energy'] for s in mandatory_slots])
+
+    while optional:
+        total_cost = mandatory_cost + sum([s['effective_price'] * s['energy'] for s in optional])
+        total_energy = mandatory_energy + sum([s['energy'] for s in optional])
+        avg = total_cost / total_energy if total_energy > 0 else 0.0
+        if avg <= max_avg_price:
+            break
+        dropped = optional.pop(0)  # Drop most expensive
+        log.info(f"Price ceiling: dropped slot at {dropped['start'].strftime('%H:%M')} "
+                 f"({dropped['effective_price']:.2f} c/kWh)")
+
+    return optional
+
+
 def _store_schedule(schedule_slots, mode="scheduled", current_soc=None):
     """Store the charging schedule to Home Assistant entities.
 
@@ -1037,7 +1201,7 @@ def _store_schedule(schedule_slots, mode="scheduled", current_soc=None):
         schedule_json = json.dumps(schedule_data)
 
         # Create human-readable summary for input_text (max 255 chars)
-        # Format: "23:30-00:15, 02:00-02:30 | 6.75 kWh | €0.42 | 6.2 c/kWh | →80%"
+        # Format: "→80% | 6.75 kWh | €0.42 | 6.2 c/kWh | 23:30-00:15, 02:00-02:30"
         try:
             if slots_json:
                 # Group consecutive slots into time ranges
@@ -1073,8 +1237,8 @@ def _store_schedule(schedule_slots, mode="scheduled", current_soc=None):
                 total_energy = schedule_data['total_energy_kwh']
                 est_cost = schedule_data['estimated_cost_eur']
 
-                soc_str = f" | →{expected_soc}%" if expected_soc is not None else ""
-                summary = f"{', '.join(range_strs)} | {total_energy:.1f} kWh | €{est_cost:.2f} | {avg_price_c_kwh:.1f} c/kWh{soc_str}"
+                soc_str = f"→{expected_soc}% | " if expected_soc is not None else ""
+                summary = f"{soc_str}{total_energy:.1f} kWh | €{est_cost:.2f} | {avg_price_c_kwh:.1f} c/kWh | {', '.join(range_strs)}"
 
                 # Truncate if still too long (shouldn't happen often)
                 if len(summary) > 255:
@@ -1118,11 +1282,11 @@ def _store_schedule(schedule_slots, mode="scheduled", current_soc=None):
 def _calculate_and_store_schedule():
     """Calculate optimal charging schedule using two-pass greedy selection.
 
-    Two-Pass Algorithm:
-    1. Pass 1 (Mandatory): If current SOC < MIN_SOC_GUARANTEE, select cheapest
-       slots BEFORE the deadline until we have enough energy to reach MIN_SOC_GUARANTEE.
-    2. Pass 2 (Optional): From remaining slots (any time), select cheapest until
-       we have enough energy to reach the charge_limit.
+    Algorithm:
+    1. Pass 1 (Mandatory): Select cheapest slots BEFORE deadline to reach MIN_SOC_GUARANTEE.
+    2. Pass 2 (Optional): Select cheapest remaining slots to reach charge_limit.
+    3. Consolidation: Relocate isolated singles/pairs adjacent to larger groups.
+    4. Price ceiling: Drop most expensive optional slots until avg <= max.
 
     The schedule is stored to HA entities for the executor to use.
 
@@ -1238,10 +1402,11 @@ def _calculate_and_store_schedule():
             log.info(f"Pass 1: Skipped - SOC {current_soc}% >= minimum {MIN_SOC_GUARANTEE}%")
 
         # =====================================================================
-        # PASS 2: Optional Charging
+        # PASS 2: Optional Charging (no price ceiling yet)
         # From REMAINING slots (any time), select cheapest to reach charge_limit
         # =====================================================================
         optional_slots = []
+        mandatory_starts = {s['start'] for s in mandatory_slots}
 
         # Calculate remaining energy needed to reach charge_limit
         soc_after_mandatory = current_soc
@@ -1257,62 +1422,54 @@ def _calculate_and_store_schedule():
             log.info(f"Pass 2: Need {optional_energy_needed:.2f} kWh for optional charging "
                      f"({soc_after_mandatory:.1f}% -> {charge_limit}%)")
 
-            # Get slot start times that were selected in mandatory pass
-            mandatory_starts = {s['start'] for s in mandatory_slots}
-
             # Filter out slots already selected in mandatory pass
             remaining_slots = [s for s in all_slots if s['start'] not in mandatory_starts]
 
             # Sort by effective price
             remaining_slots.sort(key=lambda s: s['effective_price'])
 
-            # Read price ceiling for optional slots
-            try:
-                max_avg_price_raw = state.get(OUTPUT_MAX_AVG_PRICE)
-                max_avg_price = float(max_avg_price_raw) if max_avg_price_raw not in (None, 'unavailable', 'unknown') else 0.0
-            except (ValueError, TypeError):
-                max_avg_price = 0.0
+            # Select all needed slots (price ceiling applied after consolidation)
+            optional_slots = _select_slots_for_energy(
+                remaining_slots,
+                optional_energy_needed
+            )
 
-            if max_avg_price > 0:
-                # Ceiling-aware selection: include mandatory slots in running average
-                mandatory_cost_sum = sum([s['effective_price'] * s['energy'] for s in mandatory_slots])
-                mandatory_energy_sum = sum([s['energy'] for s in mandatory_slots])
-
-                running_cost_sum = mandatory_cost_sum
-                running_energy_sum = mandatory_energy_sum
-                optional_energy_accumulated = 0.0
-
-                for slot in remaining_slots:
-                    if optional_energy_accumulated >= optional_energy_needed:
-                        break
-                    # Check if adding this slot would push avg above ceiling
-                    new_cost_sum = running_cost_sum + slot['effective_price'] * slot['energy']
-                    new_energy_sum = running_energy_sum + slot['energy']
-                    new_avg = new_cost_sum / new_energy_sum if new_energy_sum > 0 else 0.0
-                    if new_avg > max_avg_price:
-                        log.info(f"Pass 2: Price ceiling {max_avg_price:.1f} c/kWh reached. "
-                                 f"Slot at {slot['effective_price']:.2f} c/kWh would push avg to {new_avg:.2f} c/kWh")
-                        break
-                    optional_slots.append(slot)
-                    running_cost_sum = new_cost_sum
-                    running_energy_sum = new_energy_sum
-                    optional_energy_accumulated += slot['energy']
-
-                optional_energy_selected = sum([s['energy'] for s in optional_slots])
-                log.info(f"Pass 2: Selected {len(optional_slots)} optional slots "
-                         f"({optional_energy_selected:.2f} kWh) with price ceiling {max_avg_price:.1f} c/kWh")
-            else:
-                # No ceiling - use original selection
-                optional_slots = _select_slots_for_energy(
-                    remaining_slots,
-                    optional_energy_needed
-                )
-
-                optional_energy_selected = sum([s['energy'] for s in optional_slots])
-                log.info(f"Pass 2: Selected {len(optional_slots)} optional slots "
-                         f"({optional_energy_selected:.2f} kWh)")
+            optional_energy_selected = sum([s['energy'] for s in optional_slots])
+            log.info(f"Pass 2: Selected {len(optional_slots)} optional slots "
+                     f"({optional_energy_selected:.2f} kWh)")
         else:
             log.info("Pass 2: Skipped - no optional charging needed")
+
+        # =====================================================================
+        # CONSOLIDATION: Reduce fragmentation by relocating isolated slots
+        # =====================================================================
+        all_selected_slots = mandatory_slots + optional_slots
+
+        if len(all_selected_slots) > 1:
+            pre_consolidation_count = len(all_selected_slots)
+            all_selected_slots = _consolidate_slots(
+                all_selected_slots, all_slots, deadline, mandatory_starts
+            )
+            # Re-split: mandatory slots are those whose start is in original mandatory_starts
+            mandatory_slots = [s for s in all_selected_slots if s['start'] in mandatory_starts]
+            optional_slots = [s for s in all_selected_slots if s['start'] not in mandatory_starts]
+            log.info(f"Consolidation: {pre_consolidation_count} slots -> "
+                     f"{len(mandatory_slots)} mandatory + {len(optional_slots)} optional")
+
+        # =====================================================================
+        # PRICE CEILING: Drop expensive optional slots if needed
+        # =====================================================================
+        try:
+            max_avg_price_raw = state.get(OUTPUT_MAX_AVG_PRICE)
+            max_avg_price = float(max_avg_price_raw) if max_avg_price_raw not in (None, 'unavailable', 'unknown') else 0.0
+        except (ValueError, TypeError):
+            max_avg_price = 0.0
+
+        if max_avg_price > 0 and optional_slots:
+            pre_ceiling_count = len(optional_slots)
+            optional_slots = _apply_price_ceiling(mandatory_slots, optional_slots, max_avg_price)
+            if len(optional_slots) < pre_ceiling_count:
+                log.info(f"Price ceiling {max_avg_price:.1f} c/kWh: kept {len(optional_slots)}/{pre_ceiling_count} optional slots")
 
         # =====================================================================
         # Combine and store schedule
