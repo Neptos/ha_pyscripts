@@ -129,7 +129,7 @@ SOLAR_CURVE = {h: v / _SOLAR_CURVE_SUM for h, v in _SOLAR_CURVE_RAW.items()}
 BATTERY_CAPACITY_KWH = 75  # Tesla battery capacity in kWh
 CHARGING_EFFICIENCY = 0.90  # 90% charging efficiency (wall to battery)
 MAX_CHARGE_RATE_KW = 9  # Maximum charge rate: 13A x 3-phase x 230V = ~9kW
-MIN_CHARGE_AMPS = 6  # Minimum charging amperage (Tesla minimum)
+MIN_CHARGE_AMPS = 5  # Minimum charging amperage (Tesla minimum)
 MAX_CHARGE_AMPS = 13  # Maximum charging amperage (circuit limit)
 VOLTAGE = 230  # Grid voltage
 PHASES = 3  # 3-phase charging
