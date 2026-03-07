@@ -185,9 +185,9 @@ SOLAR_NEXT_HOUR = "sensor.energy_next_hour"
 SOLAR_PRODUCTION_TOMORROW = "sensor.energy_production_tomorrow"
 
 # --- Solar Production/Grid Entities ---
-SOLAR_POWER_CURRENT = "sensor.inverter_average_active_power"  # 30min average
-AVERAGE_HOUSE_LOAD = "sensor.average_house_load"              # 1h average of (inverter - grid)
+SOLAR_POWER_CURRENT = "sensor.inverter_average_active_power"
 GRID_POWER_CURRENT = "sensor.power_meter_active_power"
+GRID_POWER_15MIN_AVG = "sensor.power_meter_active_power_15min"
 
 # --- Sun Entities ---
 SUN_NEXT_RISING = "sensor.sun_next_rising"
@@ -2129,16 +2129,17 @@ def handle_solar_opportunity():
     is_charging = _is_currently_charging()
     is_solar_mode = _is_in_opportunistic_solar_mode()
 
-    # Calculate effective surplus: inverter average minus average house load.
-    # When already charging in solar mode, house_load_avg includes Tesla's draw,
-    # so add it back to see the true available solar surplus.
+    # Calculate effective surplus.
+    # Start decision: 15-min average grid power — stable, filters transient spikes.
+    # Ongoing decision: instantaneous grid_power + tesla_power — real-time accuracy,
+    #   no averaging lag regardless of how long Tesla has been charging.
     try:
-        solar_avg = float(state.get(SOLAR_POWER_CURRENT) or 0)
-        house_load_avg = float(state.get(AVERAGE_HOUSE_LOAD) or 0)
-        surplus_watts = solar_avg - house_load_avg
         if is_charging and is_solar_mode:
+            grid_power = float(state.get(GRID_POWER_CURRENT) or 0)
             tesla_power_w = float(state.get(TESLA_CHARGER_POWER) or 0) * 1000
-            surplus_watts += tesla_power_w
+            surplus_watts = grid_power + tesla_power_w
+        else:
+            surplus_watts = float(state.get(GRID_POWER_15MIN_AVG) or 0)
     except (ValueError, TypeError):
         return
 
