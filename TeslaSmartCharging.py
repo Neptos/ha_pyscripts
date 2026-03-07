@@ -70,11 +70,11 @@ KEY FEATURES
 GRID POWER CONVENTION
 ================================================================================
 
-This script follows Home Assistant's standard grid power convention:
-  - NEGATIVE values = exporting power to grid (solar surplus)
-  - POSITIVE values = importing power from grid (consumption)
+Grid power convention for sensor.power_meter_active_power:
+  - POSITIVE values = exporting power to grid (solar surplus)
+  - NEGATIVE values = importing power from grid (consumption)
 
-Example: grid_power = -2000 means exporting 2kW to the grid
+Example: grid_power = +2000 means exporting 2kW to the grid
 
 ================================================================================
 TRIGGER SCHEDULE SUMMARY
@@ -83,6 +83,7 @@ TRIGGER SCHEDULE SUMMARY
 Time Triggers:
   - cron(0 15 * * *)     : Daily schedule calculation (15:00)
   - cron(2,17,32,47 * * * *): Schedule execution every 15 minutes
+  - cron(*/15 * * * *)   : Solar opportunistic charging check every 15 minutes
 
 State Triggers:
   - input_boolean.tesla_smart_charging_enabled == 'on': Smart charging enabled -> calculate
@@ -90,7 +91,6 @@ State Triggers:
       vehicle (instant, local) -> wake Tesla integration, calculate, stop auto-charge
   - device_tracker.location == 'home' : Car arrives home -> recalculate schedule
   - binary_sensor.charge_cable == 'on': Cable connected (cloud) -> recalculate schedule
-  - sensor.power_meter_active_power   : Grid power change -> solar opportunism
 
 Services:
   - pyscript.calculate_tesla_charging_schedule : Manual schedule calculation
@@ -185,7 +185,8 @@ SOLAR_NEXT_HOUR = "sensor.energy_next_hour"
 SOLAR_PRODUCTION_TOMORROW = "sensor.energy_production_tomorrow"
 
 # --- Solar Production/Grid Entities ---
-SOLAR_POWER_CURRENT = "sensor.inverter_average_active_power"
+SOLAR_POWER_CURRENT = "sensor.inverter_average_active_power"  # 30min average
+AVERAGE_HOUSE_LOAD = "sensor.average_house_load"              # 1h average of (inverter - grid)
 GRID_POWER_CURRENT = "sensor.power_meter_active_power"
 
 # --- Sun Entities ---
@@ -355,15 +356,8 @@ def _get_current_solar_surplus():
     """
     try:
         solar_power = float(state.get(SOLAR_POWER_CURRENT) or 0)
-        grid_power = float(state.get(GRID_POWER_CURRENT) or 0)
-
-        # Grid power is negative when exporting, positive when importing
-        # Solar surplus = what we're exporting + baseload estimate
-        # If grid_power < 0, we're exporting, surplus = abs(grid_power)
-        # If grid_power > 0, we're importing, surplus = 0 (or negative)
-        surplus = -grid_power  # Negate because export is negative
-
-        return surplus
+        house_load = float(state.get(AVERAGE_HOUSE_LOAD) or 0)
+        return solar_power - house_load
     except Exception as e:
         log.warning(f"Error calculating solar surplus: {e}")
         return 0.0
@@ -1754,52 +1748,6 @@ def _is_solar_change_allowed():
     return elapsed >= MIN_CHANGE_INTERVAL_SECONDS
 
 
-# Debounce interval for solar opportunity function calls (seconds)
-SOLAR_OPPORTUNITY_DEBOUNCE_SECONDS = 5
-
-
-def _get_last_solar_opportunity_call_time():
-    """Get the timestamp of the last solar opportunity function call.
-
-    Returns:
-        datetime: Last call time or None if not set
-    """
-    try:
-        attrs = state.getattr(OUTPUT_CHARGING_STATUS) or {}
-        last_call = attrs.get("solar_opportunity_last_call")
-        if last_call:
-            return datetime.fromisoformat(last_call)
-        return None
-    except Exception as e:
-        log.warning(f"Error getting last solar opportunity call time: {e}")
-        return None
-
-
-def _set_last_solar_opportunity_call_time():
-    """Record the current time as the last solar opportunity function call."""
-    try:
-        state.setattr(OUTPUT_CHARGING_STATUS + ".solar_opportunity_last_call", datetime.now().isoformat())
-    except Exception as e:
-        log.warning(f"Error setting last solar opportunity call time: {e}")
-
-
-def _is_solar_opportunity_debounce_elapsed():
-    """Check if enough time has passed since last solar opportunity function call.
-
-    This is separate from the charging change throttle - it prevents the function
-    from doing work too frequently when grid power sensor updates rapidly.
-
-    Returns:
-        bool: True if debounce period has elapsed, False if still in debounce
-    """
-    last_call = _get_last_solar_opportunity_call_time()
-    if last_call is None:
-        return True
-
-    now = datetime.now().astimezone()
-    elapsed = (now - last_call.astimezone()).total_seconds()
-    return elapsed >= SOLAR_OPPORTUNITY_DEBOUNCE_SECONDS
-
 
 def _is_in_opportunistic_solar_mode():
     """Check if currently in opportunistic solar charging mode.
@@ -1831,13 +1779,14 @@ def _start_solar_opportunistic_charging(amps):
         amps = max(MIN_CHARGE_AMPS, min(MAX_CHARGE_AMPS, int(amps)))
         log.info(f"Starting solar opportunistic charging at {amps}A")
 
+        state.setattr(OUTPUT_CHARGING_STATUS + ".charging_started_by", "solar_opportunistic")
+        state.setattr(OUTPUT_CHARGING_STATUS + ".charging_started_at", datetime.now().isoformat())
+        state.setattr(OUTPUT_CHARGING_STATUS + ".charging_amps", amps)
+
         number.set_value(entity_id=TESLA_CHARGE_CURRENT, value=amps)
         task.sleep(2)
         switch.turn_on(entity_id=TESLA_CHARGE_SWITCH)
 
-        state.setattr(OUTPUT_CHARGING_STATUS + ".charging_started_by", "solar_opportunistic")
-        state.setattr(OUTPUT_CHARGING_STATUS + ".charging_started_at", datetime.now().isoformat())
-        state.setattr(OUTPUT_CHARGING_STATUS + ".charging_amps", amps)
         _set_last_solar_change_time()
 
         return True
@@ -2131,6 +2080,8 @@ def on_charging_started():
     if _is_in_scheduled_slot():
         log.info("Charging in scheduled slot - allowing")
         state.setattr(OUTPUT_CHARGING_STATUS + ".charging_started_by", "smart_charging")
+    elif _is_in_opportunistic_solar_mode():
+        log.info("Charging started by solar opportunism - allowing")
     else:
         log.info("Stopping auto-started charging - not in scheduled slot")
         if not _stop_charging():
@@ -2138,49 +2089,29 @@ def on_charging_started():
         _update_charging_status(4, "Auto-charge stopped - waiting for slot")
 
 
-@state_trigger(f"{GRID_POWER_CURRENT}")
+@time_trigger("cron(*/15 * * * *)")
 def handle_solar_opportunity():
     """Handle solar opportunistic charging based on grid power.
 
-    Monitors grid power export and starts/adjusts charging when there's
-    excess solar. Three-tier decision logic:
+    Runs every 15 minutes and reads a 15-minute average grid power sensor
+    to smooth out fluctuations. Three-tier decision logic:
     - Tier 1 PURE: surplus >= SOLAR_START_THRESHOLD_W (4500W) - charge at calculated amps
     - Tier 2 BLENDED: surplus >= SOLAR_BLENDED_MIN_W (1500W) - charge at min amps if price cheap
     - Tier 3 STOP: surplus < SOLAR_BLENDED_MIN_W - stop opportunistic charging
 
-    Grid power convention: negative = exporting, positive = importing.
-    So we look for grid_power < -4500 to start pure solar charging.
-
-    Performance: This function is triggered on every grid power sensor update,
-    which can be very frequent. Quick precondition checks are done first to
-    minimize work, and a 5-second debounce prevents excessive processing.
+    Grid power convention for sensor: positive = exporting, negative = importing.
     """
-    # =======================================================================
-    # QUICK PRECONDITION CHECKS - do these first to minimize work
-    # These use cached state and are very fast
-    # =======================================================================
-
     # Skip if smart charging is disabled
     if not _is_smart_charging_enabled():
         return
 
-    # Skip if not during daylight hours (uses cached sun state)
+    # Skip if not during daylight hours
     if not _is_during_daylight():
         return
 
-    # Skip if car not at home or cable not connected (uses cached state)
+    # Skip if car not at home or cable not connected
     if not _is_car_at_home() or not _is_cable_connected():
         return
-
-    # =======================================================================
-    # DEBOUNCE CHECK - prevent function from running too frequently
-    # This is separate from the charging change throttle
-    # =======================================================================
-    if not _is_solar_opportunity_debounce_elapsed():
-        return
-
-    # Record this function call time for debouncing
-    _set_last_solar_opportunity_call_time()
 
     # =======================================================================
     # SLOWER CHECKS - after debounce
@@ -2195,17 +2126,21 @@ def handle_solar_opportunity():
     if not _is_solar_change_allowed():
         return
 
-    # Get current grid power (negative = exporting)
-    try:
-        grid_power = float(state.get(GRID_POWER_CURRENT) or 0)
-    except (ValueError, TypeError):
-        return
-
-    # Calculate surplus: positive when exporting (grid_power is negative)
-    surplus_watts = -grid_power
-
     is_charging = _is_currently_charging()
     is_solar_mode = _is_in_opportunistic_solar_mode()
+
+    # Calculate effective surplus: inverter average minus average house load.
+    # When already charging in solar mode, house_load_avg includes Tesla's draw,
+    # so add it back to see the true available solar surplus.
+    try:
+        solar_avg = float(state.get(SOLAR_POWER_CURRENT) or 0)
+        house_load_avg = float(state.get(AVERAGE_HOUSE_LOAD) or 0)
+        surplus_watts = solar_avg - house_load_avg
+        if is_charging and is_solar_mode:
+            tesla_power_w = float(state.get(TESLA_CHARGER_POWER) or 0) * 1000
+            surplus_watts += tesla_power_w
+    except (ValueError, TypeError):
+        return
 
     # Check current SOC - don't solar charge if already at limit
     current_soc = _get_current_soc()
