@@ -2235,6 +2235,16 @@ def handle_solar_opportunity():
 # =============================================================================
 
 @service
+def teslaSolarOpportunityCheck():
+    """Manually trigger a solar opportunistic charging check.
+
+    Call from HA Developer Tools > Services > pyscript.tesla_solar_opportunity_check
+    """
+    log.warning("Manually triggering solar opportunity check")
+    handle_solar_opportunity()
+
+
+@service
 def teslaSmartChargingTestService(action=None, id=None):
     """Service to manually trigger Tesla smart charging calculations.
 
