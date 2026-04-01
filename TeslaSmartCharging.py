@@ -152,7 +152,6 @@ SOLAR_START_THRESHOLD_W = 4500  # Pure solar: surplus covers full minimum charge
 
 # Blended Solar+Grid Charging Parameters
 SOLAR_BLENDED_MIN_W = 1500  # Minimum solar surplus for blended solar+grid charging
-BLENDED_PRICE_THRESHOLD_FACTOR = 0.75  # 75% of daily average = cheap enough for blended
 
 SOLAR_FORECAST_CONFIDENCE = 0.80  # 80% confidence factor for solar forecasts
 BASELOAD_ESTIMATE_KW = 1.0  # Estimated base load of house (kW)
@@ -506,68 +505,43 @@ def _calculate_blended_effective_price(excess_solar_w, buy_price, sell_price):
 
 
 def _is_price_cheap(price):
-    """Check if the given price is considered cheap for blended charging.
+    """Check if the given price is cheaper than the scheduled charging average.
 
-    Compares the price against the daily average from Nordpool sensor.
-    A price is considered "cheap" if it's below BLENDED_PRICE_THRESHOLD_FACTOR
-    (default 75%) of the daily average.
-
-    This function is used by the blended solar charging logic to determine
-    whether grid prices are favorable enough to charge using a mix of
-    solar and grid power.
+    Compares the blended effective price against the average price of the
+    current charging schedule. Only charge blended if it's actually cheaper
+    than what we'd pay during scheduled slots.
 
     Args:
-        price: Current electricity price in EUR/kWh to evaluate
+        price: Current blended effective price in EUR/kWh to evaluate
 
     Returns:
-        bool: True if price is cheap (below threshold), False otherwise.
-              Returns False if price is None or no price data available
-              (conservative default - don't charge when uncertain).
+        bool: True if price is below scheduled average, False otherwise.
+              Returns False if price is None or no schedule data available.
     """
-    # Handle None or invalid price input
     if price is None:
-        log.debug("_is_price_cheap: price is None, returning False (conservative)")
+        log.debug("_is_price_cheap: price is None, returning False")
         return False
 
     try:
-        # Get Nordpool sensor attributes
-        nordpool_attrs = state.getattr(NORDPOOL_SENSOR) or {}
-        raw_today = nordpool_attrs.get('raw_today', [])
+        attrs = state.getattr(OUTPUT_CHARGING_STATUS) or {}
+        scheduled_avg = attrs.get("avg_price_c_kwh")
 
-        if not raw_today:
-            log.debug("_is_price_cheap: No raw_today price data, returning False (conservative)")
+        if scheduled_avg is None:
+            log.debug("_is_price_cheap: No scheduled avg price, returning False")
             return False
 
-        # Extract prices from raw_today entries
-        prices = []
-        for entry in raw_today:
-            if 'value' in entry and entry['value'] is not None:
-                try:
-                    prices.append(float(entry['value']))
-                except (ValueError, TypeError):
-                    continue
+        # Convert scheduled avg from c/kWh to EUR/kWh for comparison
+        threshold = float(scheduled_avg) / 100.0
 
-        if not prices:
-            log.debug("_is_price_cheap: No valid prices found in raw_today, returning False (conservative)")
-            return False
-
-        # Calculate daily average
-        daily_average = sum(prices) / len(prices)
-
-        # Calculate threshold
-        threshold = daily_average * BLENDED_PRICE_THRESHOLD_FACTOR
-
-        # Compare price to threshold
         is_cheap = price < threshold
 
-        log.debug(f"_is_price_cheap: price={price:.4f}, avg={daily_average:.4f}, "
-                  f"threshold={threshold:.4f} ({BLENDED_PRICE_THRESHOLD_FACTOR*100:.0f}%), "
+        log.debug(f"_is_price_cheap: blended={price:.4f}, scheduled_avg={threshold:.4f} EUR/kWh, "
                   f"is_cheap={is_cheap}")
 
         return is_cheap
 
     except Exception as e:
-        log.warning(f"_is_price_cheap: Error calculating price threshold: {e}")
+        log.warning(f"_is_price_cheap: Error: {e}")
         return False
 
 
