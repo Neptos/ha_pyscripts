@@ -198,6 +198,7 @@ OUTPUT_CHARGING_STATUS = "input_number.tesla_charging_status"
 OUTPUT_CHARGING_SCHEDULE = "input_text.tesla_charging_schedule"
 OUTPUT_SMART_CHARGING_ENABLED = "input_boolean.tesla_smart_charging_enabled"
 OUTPUT_MAX_AVG_PRICE = "input_number.tesla_max_avg_price"
+OUTPUT_SOLAR_AVAILABLE = "input_select.tesla_solar_charging_available"
 
 
 # =============================================================================
@@ -344,23 +345,6 @@ def _get_charge_limit():
         log.warning(f"Error getting charge limit: {e}")
         return None
 
-
-def _get_current_solar_surplus():
-    """Calculate current solar surplus available for charging.
-
-    Solar surplus = solar production - base load - grid export
-    Positive value means excess solar available for charging.
-
-    Returns:
-        float: Solar surplus in Watts (positive = surplus, negative = deficit)
-    """
-    try:
-        solar_power = float(state.get(SOLAR_POWER_CURRENT) or 0)
-        house_load = float(state.get(AVERAGE_HOUSE_LOAD) or 0)
-        return solar_power - house_load
-    except Exception as e:
-        log.warning(f"Error calculating solar surplus: {e}")
-        return 0.0
 
 
 def _get_current_prices():
@@ -601,6 +585,13 @@ def _is_during_daylight():
         return 6 <= current_hour < 21
 
     now = datetime.now().astimezone()
+
+    # sun_next_rising/setting always point to the NEXT occurrence.
+    # During daytime: next_rising = tomorrow, next_setting = today (sunrise > sunset).
+    # Detect this inverted order to correctly identify daytime.
+    if sunrise > sunset:
+        return now <= sunset
+
     return sunrise <= now <= sunset
 
 
@@ -2103,11 +2094,61 @@ def handle_solar_opportunity():
     """
     # Skip if smart charging is disabled
     if not _is_smart_charging_enabled():
+        input_select.select_option(entity_id=OUTPUT_SOLAR_AVAILABLE, option="off")
         return
 
     # Skip if not during daylight hours
     if not _is_during_daylight():
+        input_select.select_option(entity_id=OUTPUT_SOLAR_AVAILABLE, option="off")
         return
+
+    # Read surplus early so we can update the availability indicator
+    # before car-specific gates.
+    is_charging = _is_currently_charging()
+    is_solar_mode = _is_in_opportunistic_solar_mode()
+
+    # Calculate effective surplus for charging decisions.
+    # Start decision: 15-min average grid power — stable, filters transient spikes.
+    # Ongoing decision: instantaneous grid_power + tesla_power — real-time accuracy,
+    #   no averaging lag regardless of how long Tesla has been charging.
+    try:
+        if is_charging and is_solar_mode:
+            grid_power = float(state.get(GRID_POWER_CURRENT) or 0)
+            tesla_power_w = float(state.get(TESLA_CHARGER_POWER) or 0) * 1000
+            surplus_watts = grid_power + tesla_power_w
+        else:
+            surplus_watts = float(state.get(GRID_POWER_15MIN_AVG) or 0)
+    except (ValueError, TypeError):
+        input_select.select_option(entity_id=OUTPUT_SOLAR_AVAILABLE, option="off")
+        return
+
+    # Calculate "unplugged" surplus for the availability indicator:
+    # "would solar charging start if I plugged in now?"
+    # If car is charging (any mode), add back Tesla draw to get true available surplus.
+    try:
+        if is_charging:
+            tesla_power_w = float(state.get(TESLA_CHARGER_POWER) or 0) * 1000
+            available_surplus = float(state.get(GRID_POWER_15MIN_AVG) or 0) + tesla_power_w
+        else:
+            available_surplus = surplus_watts
+    except (ValueError, TypeError):
+        available_surplus = surplus_watts
+
+    # Update solar availability indicator: off / blended / pure
+    if available_surplus >= SOLAR_START_THRESHOLD_W:
+        input_select.select_option(entity_id=OUTPUT_SOLAR_AVAILABLE, option="pure")
+    elif available_surplus >= SOLAR_BLENDED_MIN_W:
+        buy_price, _ = _get_current_prices()
+        if buy_price is not None:
+            eff_price = _calculate_blended_effective_price(available_surplus, buy_price, float(state.get(SELL_PRICE_SENSOR) or 0))
+            if _is_price_cheap(eff_price):
+                input_select.select_option(entity_id=OUTPUT_SOLAR_AVAILABLE, option="blended")
+            else:
+                input_select.select_option(entity_id=OUTPUT_SOLAR_AVAILABLE, option="off")
+        else:
+            input_select.select_option(entity_id=OUTPUT_SOLAR_AVAILABLE, option="off")
+    else:
+        input_select.select_option(entity_id=OUTPUT_SOLAR_AVAILABLE, option="off")
 
     # Skip if car not at home or cable not connected
     if not _is_car_at_home() or not _is_cable_connected():
@@ -2124,23 +2165,6 @@ def handle_solar_opportunity():
     # Throttle actual charging changes to prevent rapid cycling
     # (this is the 5-minute interval between start/stop commands)
     if not _is_solar_change_allowed():
-        return
-
-    is_charging = _is_currently_charging()
-    is_solar_mode = _is_in_opportunistic_solar_mode()
-
-    # Calculate effective surplus.
-    # Start decision: 15-min average grid power — stable, filters transient spikes.
-    # Ongoing decision: instantaneous grid_power + tesla_power — real-time accuracy,
-    #   no averaging lag regardless of how long Tesla has been charging.
-    try:
-        if is_charging and is_solar_mode:
-            grid_power = float(state.get(GRID_POWER_CURRENT) or 0)
-            tesla_power_w = float(state.get(TESLA_CHARGER_POWER) or 0) * 1000
-            surplus_watts = grid_power + tesla_power_w
-        else:
-            surplus_watts = float(state.get(GRID_POWER_15MIN_AVG) or 0)
-    except (ValueError, TypeError):
         return
 
     # Check current SOC - don't solar charge if already at limit
@@ -2261,7 +2285,7 @@ def teslaSmartChargingTestService(action=None, id=None):
     log.info(f"Current SOC: {_get_current_soc()}%")
     log.info(f"Charge limit: {_get_charge_limit()}%")
     log.info(f"Is daylight: {_is_during_daylight()}")
-    log.info(f"Solar surplus: {_get_current_solar_surplus()}W")
+    log.info(f"Grid power (15min avg): {state.get(GRID_POWER_15MIN_AVG)}W")
 
     sunrise, sunset = _get_sunrise_sunset()
     log.info(f"Sunrise: {sunrise}, Sunset: {sunset}")
@@ -2357,13 +2381,6 @@ def teslaSmartChargingTestService(action=None, id=None):
                 eff = _calculate_blended_effective_price(surplus, buy_price, sell_price)
                 solar_frac = min(surplus / MIN_CHARGE_POWER_W, 1.0) * 100
                 log.info(f"  {surplus}W surplus: {eff:.4f} EUR/kWh ({solar_frac:.0f}% solar)")
-
-            # Test _is_price_cheap() with sample prices
-            current_surplus = _get_current_solar_surplus()
-            if current_surplus > 0:
-                current_eff = _calculate_blended_effective_price(current_surplus, buy_price, sell_price)
-                is_cheap = _is_price_cheap(current_eff)
-                log.info(f"Current surplus {current_surplus}W -> effective {current_eff:.4f} EUR/kWh -> cheap: {is_cheap}")
 
             # Test with known prices
             log.info(f"_is_price_cheap() tests:")

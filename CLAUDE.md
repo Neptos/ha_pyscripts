@@ -95,6 +95,7 @@ Optimizes Tesla charging based on Nordpool spot prices and solar production fore
 - `input_text.tesla_charging_schedule` - Human-readable schedule summary, e.g.: `"3 slots: 23:30-00:15, 02:00-02:30 | 6.75 kWh | €0.42 | 6.2 c/kWh"`
 - `input_boolean.tesla_smart_charging_enabled` - Master on/off toggle
 - `input_number.tesla_max_avg_price` - Price ceiling for average charging cost (c/kWh, 0-30, step 0.5). Set to 0 to disable. Only affects optional (Pass 2) slots — mandatory 50% guarantee always completes.
+- `input_select.tesla_solar_charging_available` - Solar charging availability indicator. Options: `off`, `blended`, `pure`. Updated every 15 minutes during daylight. Reflects what would happen if the car were plugged in now (adds back Tesla draw if already charging).
 
 **Key Features**:
 - Two-pass greedy algorithm: Pass 1 (mandatory) ensures 50% SOC by 7:00 AM, Pass 2 (optional) fills to charge limit
@@ -108,3 +109,31 @@ Optimizes Tesla charging based on Nordpool spot prices and solar production fore
 - `avg_price_c_kwh` - Energy-weighted average effective price (c/kWh)
 - `estimated_cost_eur` - Total estimated cost in EUR
 - `slot_count`, `solar_slots_count`, `mode`, `next_slot_start`, `schedule_end`
+
+## Automations
+
+YAML automations in `automations/` are loaded by HA via `automation: !include_dir_list automations/` in `configuration.yaml`. Each file contains a single automation (not wrapped in a list).
+
+### Doorbell Camera Notifications
+
+Sends temporary, rate-limited phone notifications from a UniFi Protect G4 Doorbell Pro PoE camera. Enable the toggle when expecting guests; it auto-disables after 2 hours.
+
+**Files**:
+- `automations/doorbell_notifications.yaml` - Detection notification automation
+- `automations/doorbell_notifications_auto_disable.yaml` - 2-hour auto-disable with restart resilience
+
+**Required Helpers** (create in HA UI before deploying):
+- `input_boolean.doorbell_notifications_enabled` - Master toggle (default: off)
+- `input_select.doorbell_notification_target` - Phone selector; options must be `mobile_app_<phone_name>` (the suffix of `notify.mobile_app_*` services — check Developer Tools → Services)
+- `timer.doorbell_notification_cooldown` - Rate limit timer (duration: `00:10:00`)
+- `timer.doorbell_notifications_auto_disable` - Auto-disable timer (duration: `02:00:00`)
+- **Important**: Enable "Restore state and time" on both timers. If the UI checkbox doesn't persist (known bug), configure via `configuration.yaml` instead: `timer: {doorbell_notification_cooldown: {duration: "00:10:00", restore: true}, doorbell_notifications_auto_disable: {duration: "02:00:00", restore: true}}`
+
+**Detection Sensors** (UniFi Protect G4 Doorbell Pro PoE):
+- `binary_sensor.g4_doorbell_pro_poe_person_detected`
+- `binary_sensor.g4_doorbell_pro_poe_vehicle_detected`
+- `binary_sensor.g4_doorbell_pro_poe_animal_detected`
+- `binary_sensor.g4_doorbell_pro_poe_package_detected`
+- `binary_sensor.g4_doorbell_pro_poe_doorbell`
+
+**Camera snapshot**: `camera.g4_doorbell_pro_poe_high` — verify entity ID in Developer Tools → States before deploying.
