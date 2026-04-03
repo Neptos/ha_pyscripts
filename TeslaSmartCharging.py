@@ -2079,12 +2079,13 @@ def handle_solar_opportunity():
     # Skip if smart charging is disabled
     if not _is_smart_charging_enabled():
         input_select.select_option(entity_id=OUTPUT_SOLAR_AVAILABLE, option="off")
+        log.warning("SOLAR EXIT: smart charging disabled")
         return
 
     # Skip if not during daylight hours
     if not _is_during_daylight():
-        log.warning("Not during daylight, skipping solar opportunity")
         input_select.select_option(entity_id=OUTPUT_SOLAR_AVAILABLE, option="off")
+        log.warning("SOLAR EXIT: not during daylight")
         return
 
     # Read surplus early so we can update the availability indicator
@@ -2105,7 +2106,10 @@ def handle_solar_opportunity():
             surplus_watts = float(state.get(GRID_POWER_15MIN_AVG) or 0)
     except (ValueError, TypeError):
         input_select.select_option(entity_id=OUTPUT_SOLAR_AVAILABLE, option="off")
+        log.warning("SOLAR EXIT: error reading surplus")
         return
+
+    log.warning(f"SOLAR: surplus={surplus_watts:.0f}W, charging={is_charging}, solar_mode={is_solar_mode}")
 
     # Calculate "unplugged" surplus for the availability indicator:
     # "would solar charging start if I plugged in now?"
@@ -2126,17 +2130,21 @@ def handle_solar_opportunity():
         buy_price, _ = _get_current_prices()
         if buy_price is not None:
             eff_price = _calculate_blended_effective_price(available_surplus, buy_price, float(state.get(SELL_PRICE_SENSOR) or 0))
-            if _is_price_cheap(eff_price):
+            is_cheap = _is_price_cheap(eff_price)
+            log.warning(f"SOLAR HELPER: blended check - surplus={available_surplus:.0f}W, eff_price={eff_price:.4f}, cheap={is_cheap}")
+            if is_cheap:
                 input_select.select_option(entity_id=OUTPUT_SOLAR_AVAILABLE, option="blended")
             else:
                 input_select.select_option(entity_id=OUTPUT_SOLAR_AVAILABLE, option="off")
         else:
             input_select.select_option(entity_id=OUTPUT_SOLAR_AVAILABLE, option="off")
+            log.warning("SOLAR HELPER: no buy price available")
     else:
         input_select.select_option(entity_id=OUTPUT_SOLAR_AVAILABLE, option="off")
 
     # Skip if car not at home or cable not connected
     if not _is_car_at_home() or not _is_cable_connected():
+        log.warning(f"SOLAR EXIT: car_home={_is_car_at_home()}, cable={_is_cable_connected()}")
         return
 
     # =======================================================================
@@ -2145,11 +2153,13 @@ def handle_solar_opportunity():
 
     # Skip if in a scheduled charging slot (scheduled charging takes priority)
     if _is_in_scheduled_slot():
+        log.warning("SOLAR EXIT: in scheduled slot")
         return
 
     # Throttle actual charging changes to prevent rapid cycling
     # (this is the 5-minute interval between start/stop commands)
     if not _is_solar_change_allowed():
+        log.warning("SOLAR EXIT: change not allowed (cooldown)")
         return
 
     # Check current SOC - don't solar charge if already at limit
