@@ -2070,7 +2070,7 @@ def handle_solar_opportunity():
 
     Grid power convention for sensor: positive = exporting, negative = importing.
     """
-    log.info("handle_solar_opportunity triggered")
+    log.warning("handle_solar_opportunity triggered")
 
     # Skip if smart charging is disabled
     if not _is_smart_charging_enabled():
@@ -2079,7 +2079,7 @@ def handle_solar_opportunity():
 
     # Skip if not during daylight hours
     if not _is_during_daylight():
-        log.info("Not during daylight, skipping solar opportunity")
+        log.warning("Not during daylight, skipping solar opportunity")
         input_select.select_option(entity_id=OUTPUT_SOLAR_AVAILABLE, option="off")
         return
 
