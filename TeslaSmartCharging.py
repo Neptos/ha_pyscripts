@@ -2127,9 +2127,9 @@ def handle_solar_opportunity():
     if available_surplus >= SOLAR_START_THRESHOLD_W:
         input_select.select_option(entity_id=OUTPUT_SOLAR_AVAILABLE, option="pure")
     elif available_surplus >= SOLAR_BLENDED_MIN_W:
-        buy_price, _ = _get_current_prices()
+        buy_price, sell_price = _get_current_prices()
         if buy_price is not None:
-            eff_price = _calculate_blended_effective_price(available_surplus, buy_price, float(state.get(SELL_PRICE_SENSOR) or 0))
+            eff_price = _calculate_blended_effective_price(available_surplus, buy_price, sell_price or 0)
             is_cheap = _is_price_cheap(eff_price)
             log.warning(f"SOLAR HELPER: blended check - surplus={available_surplus:.0f}W, eff_price={eff_price:.4f}, cheap={is_cheap}")
             if is_cheap:
