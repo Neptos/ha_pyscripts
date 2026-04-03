@@ -1929,14 +1929,18 @@ def executeTeslaChargingSchedule():
     else:
         # Outside scheduled slots
         if is_charging:
-            log.info("Stopping charging - outside scheduled slot")
-            if _stop_charging():
-                _update_charging_status(4, "Paused - waiting for next slot")
+            # Don't stop solar opportunistic charging — it's managed by handle_solar_opportunity
+            if _is_in_opportunistic_solar_mode():
+                log.debug("Outside scheduled slot but in solar mode, not stopping")
             else:
-                log.warning("Failed to stop charging")
-        elif schedule.get('slots'):
+                log.info("Stopping charging - outside scheduled slot")
+                if _stop_charging():
+                    _update_charging_status(4, "Paused - waiting for next slot")
+                else:
+                    log.warning("Failed to stop charging")
+        elif not _is_in_opportunistic_solar_mode() and schedule.get('slots'):
             _update_charging_status(1, "Waiting for scheduled slot")
-        else:
+        elif not _is_in_opportunistic_solar_mode():
             _update_charging_status(0, "No charging scheduled")
 
 
@@ -2066,6 +2070,8 @@ def handle_solar_opportunity():
 
     Grid power convention for sensor: positive = exporting, negative = importing.
     """
+    log.info("handle_solar_opportunity triggered")
+
     # Skip if smart charging is disabled
     if not _is_smart_charging_enabled():
         input_select.select_option(entity_id=OUTPUT_SOLAR_AVAILABLE, option="off")
@@ -2073,6 +2079,7 @@ def handle_solar_opportunity():
 
     # Skip if not during daylight hours
     if not _is_during_daylight():
+        log.info("Not during daylight, skipping solar opportunity")
         input_select.select_option(entity_id=OUTPUT_SOLAR_AVAILABLE, option="off")
         return
 
