@@ -354,7 +354,7 @@ def _get_current_prices():
     prices, falling back to current state value if time-varying data unavailable.
 
     Returns:
-        tuple: (buy_price, sell_price) as floats in EUR/kWh, or (None, None) if unavailable
+        tuple: (buy_price, sell_price) as floats in c/kWh, or (None, None) if unavailable
     """
     try:
         # Calculate current 15-minute slot start time
@@ -445,7 +445,7 @@ def _get_current_prices():
             sell_price = buy_price * 0.5
 
         log.debug(f"Current prices for slot {slot_start.strftime('%H:%M')}: "
-                  f"buy={buy_price:.4f}, sell={sell_price:.4f} EUR/kWh")
+                  f"buy={buy_price:.4f}, sell={sell_price:.4f} c/kWh")
 
         return buy_price, sell_price
 
@@ -468,11 +468,11 @@ def _calculate_blended_effective_price(excess_solar_w, buy_price, sell_price):
 
     Args:
         excess_solar_w: Current excess solar power available in Watts
-        buy_price: Current grid electricity buy price (EUR/kWh)
-        sell_price: Current solar export/sell price (EUR/kWh)
+        buy_price: Current grid electricity buy price (c/kWh)
+        sell_price: Current solar export/sell price (c/kWh)
 
     Returns:
-        float: Blended effective price per kWh in EUR
+        float: Blended effective price per kWh in c/kWh
     """
     # Handle edge cases
     if excess_solar_w is None or excess_solar_w < 0:
@@ -512,7 +512,7 @@ def _is_price_cheap(price):
     than what we'd pay during scheduled slots.
 
     Args:
-        price: Current blended effective price in EUR/kWh to evaluate
+        price: Current blended effective price in c/kWh to evaluate
 
     Returns:
         bool: True if price is below scheduled average, False otherwise.
@@ -532,14 +532,13 @@ def _is_price_cheap(price):
             if max_avg <= 0:
                 log.debug("_is_price_cheap: No scheduled avg and no max avg price configured")
                 return False
-            threshold = max_avg / 100.0
+            threshold = max_avg
         else:
-            # Convert scheduled avg from c/kWh to EUR/kWh for comparison
-            threshold = float(scheduled_avg) / 100.0
+            threshold = float(scheduled_avg)
 
         is_cheap = price < threshold
 
-        log.debug(f"_is_price_cheap: blended={price:.4f}, scheduled_avg={threshold:.4f} EUR/kWh, "
+        log.debug(f"_is_price_cheap: blended={price:.2f} c/kWh, threshold={threshold:.2f} c/kWh, "
                   f"is_cheap={is_cheap}")
 
         return is_cheap
@@ -652,12 +651,12 @@ def _calculate_effective_price(slot_start, buy_price, sell_price):
 
     Args:
         slot_start: datetime of slot start (timezone-aware)
-        buy_price: Grid electricity buy price (EUR/kWh)
-        sell_price: Solar export/sell price (EUR/kWh)
+        buy_price: Grid electricity buy price (c/kWh)
+        sell_price: Solar export/sell price (c/kWh)
 
     Returns:
         tuple: (effective_price_per_kwh, solar_energy_kwh, grid_energy_kwh)
-            - effective_price_per_kwh: Blended cost per kWh for this slot
+            - effective_price_per_kwh: Blended cost per kWh for this slot (c/kWh)
             - solar_energy_kwh: kWh that can be covered by solar
             - grid_energy_kwh: kWh that must come from grid
     """
@@ -705,9 +704,9 @@ def _build_slot_list_with_effective_prices():
               Each slot contains:
               - start: datetime of slot start
               - end: datetime of slot end
-              - buy_price: Grid buy price (EUR/kWh)
-              - sell_price: Solar export price (EUR/kWh)
-              - effective_price: Blended cost accounting for solar (EUR/kWh)
+              - buy_price: Grid buy price (c/kWh)
+              - sell_price: Solar export price (c/kWh)
+              - effective_price: Blended cost accounting for solar (c/kWh)
               - solar_energy: kWh from solar in this slot
               - grid_energy: kWh from grid in this slot
               - energy: Total kWh charged in this slot (at max rate)
@@ -827,7 +826,7 @@ def _build_slot_list_with_effective_prices():
         if slots:
             cheapest = slots[0]
             most_expensive = slots[-1]
-            log.info(f"Price range: {cheapest['effective_price']:.4f} - {most_expensive['effective_price']:.4f} EUR/kWh")
+            log.info(f"Price range: {cheapest['effective_price']:.2f} - {most_expensive['effective_price']:.2f} c/kWh")
 
         return slots
 
