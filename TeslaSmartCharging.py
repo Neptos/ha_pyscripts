@@ -526,12 +526,16 @@ def _is_price_cheap(price):
         attrs = state.getattr(OUTPUT_CHARGING_STATUS) or {}
         scheduled_avg = attrs.get("avg_price_c_kwh")
 
-        if scheduled_avg is None:
-            log.debug("_is_price_cheap: No scheduled avg price, returning False")
-            return False
-
-        # Convert scheduled avg from c/kWh to EUR/kWh for comparison
-        threshold = float(scheduled_avg) / 100.0
+        if scheduled_avg is None or float(scheduled_avg) <= 0:
+            # No schedule — fall back to configured max avg price
+            max_avg = float(state.get(OUTPUT_MAX_AVG_PRICE) or 0)
+            if max_avg <= 0:
+                log.debug("_is_price_cheap: No scheduled avg and no max avg price configured")
+                return False
+            threshold = max_avg / 100.0
+        else:
+            # Convert scheduled avg from c/kWh to EUR/kWh for comparison
+            threshold = float(scheduled_avg) / 100.0
 
         is_cheap = price < threshold
 
