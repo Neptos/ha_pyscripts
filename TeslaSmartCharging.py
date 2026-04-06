@@ -1923,7 +1923,11 @@ def executeTeslaChargingSchedule():
                 log.warning("Failed to start charging")
                 _update_charging_status(-1, "Failed to start charging")
         else:
-            # Already charging, just update status
+            # Already charging - verify amps are at MAX for scheduled slot
+            current_amps = int(float(state.get(TESLA_CHARGE_CURRENT) or 0))
+            if current_amps < MAX_CHARGE_AMPS:
+                log.warning(f"Scheduled slot: adjusting amps {current_amps}A -> {MAX_CHARGE_AMPS}A")
+                _adjust_charging_amps(MAX_CHARGE_AMPS)
             solar_energy = current_slot.get('solar_energy', 0)
             if solar_energy > 0.5:
                 _update_charging_status(3, "Charging (solar)")
