@@ -1943,6 +1943,8 @@ def executeTeslaChargingSchedule():
                 log.info("Stopping charging - outside scheduled slot")
                 if _stop_charging():
                     _update_charging_status(4, "Paused - waiting for next slot")
+                    # Immediately evaluate solar conditions for seamless transition
+                    handle_solar_opportunity()
                 else:
                     log.warning("Failed to stop charging")
         elif not _is_in_opportunistic_solar_mode() and schedule.get('slots'):
