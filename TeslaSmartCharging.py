@@ -40,6 +40,12 @@ Create these helpers in Home Assistant BEFORE deploying this script:
    - Set to 0 to disable price ceiling
    - Only affects optional (Pass 2) slots. Mandatory 50% guarantee always completes.
 
+5. input_select.tesla_solar_charging_available
+   - Options: off, blended, pure
+   - Solar charging availability indicator. Updated every 15 minutes
+     during daylight. Reflects what would happen if the car were
+     plugged in now (adds back Tesla draw if already charging).
+
 ================================================================================
 KEY FEATURES
 ================================================================================
@@ -482,7 +488,7 @@ def _calculate_blended_effective_price(excess_solar_w, buy_price, sell_price):
 
     if buy_price is None or buy_price < 0:
         # If no buy price available, can't calculate - return a high default
-        return 1.0
+        return 999.0
 
     if sell_price is None or sell_price < 0:
         # If no sell price, assume zero opportunity cost for solar
@@ -1224,7 +1230,7 @@ def _calculate_and_store_schedule():
     3. Consolidation: Relocate isolated singles/pairs adjacent to larger groups.
     4. Price ceiling: Drop most expensive optional slots until avg <= max.
 
-    The schedule is stored to HA entities for the executor to use.
+    The schedule is stored to HA entities for the tesla_charging_control controller to use.
 
     Returns:
         dict: Schedule result with keys:
@@ -1829,18 +1835,6 @@ def _update_solar_availability_indicator(is_charging, is_daylight, grid_power_av
     input_select.select_option(entity_id=OUTPUT_SOLAR_AVAILABLE, option='off')
 
 
-def _update_charging_schedule(message):
-    """Update the charging schedule output sensor with a status message.
-
-    Args:
-        message: Human-readable status message (max 255 chars)
-    """
-    try:
-        input_text.tesla_charging_schedule = str(message)[:255]
-    except Exception as e:
-        log.warning(f"Error updating charging schedule: {e}")
-
-
 # =============================================================================
 # SCHEDULED TRIGGERS
 # =============================================================================
@@ -1905,6 +1899,9 @@ def tesla_charging_control():
 
     is_charging = _is_currently_charging()
 
+    # Decision-input gather block — kept in sync with teslaSmartChargingTestService
+    # (the diagnostic service mirrors this to log what the controller would decide).
+    #
     # Gather shared state once per tick — passed into helpers to avoid redundant reads.
     # is_daylight is cheap; grid and tesla power are single lookups; prices are only
     # fetched when daylight (the scheduled-slot path below never needs them).
@@ -1932,8 +1929,14 @@ def tesla_charging_control():
     if is_daylight:
         buy_price, sell_price = _get_current_prices()
 
-    _update_solar_availability_indicator(is_charging, is_daylight, grid_power_avg,
-                                         tesla_power_w, buy_price, sell_price)
+    _update_solar_availability_indicator(
+        is_charging=is_charging,
+        is_daylight=is_daylight,
+        grid_power_avg=grid_power_avg,
+        tesla_power_w=tesla_power_w,
+        buy_price=buy_price,
+        sell_price=sell_price,
+    )
 
     if not _is_car_at_home() or not _is_cable_connected():
         return
@@ -2187,7 +2190,7 @@ def teslaSmartChargingTestService(action=None, id=None):
         log.warning(f"Error testing scheduling algorithm: {e}")
         # Fall back to simple status update
         _update_charging_status(0, "Test service executed")
-        _update_charging_schedule("Test service - schedule calculation failed")
+        input_text.tesla_charging_schedule = str("Test service - schedule calculation failed")[:255]
 
     # Test blended pricing functions
     try:
@@ -2219,6 +2222,7 @@ def teslaSmartChargingTestService(action=None, id=None):
     try:
         log.info("Testing unified controller decision logic...")
 
+        # Mirror of tesla_charging_control's gather block — keep in sync.
         # Gather live state for a sample decision
         schedule_now = _get_stored_schedule()
         is_in_slot_now = False
