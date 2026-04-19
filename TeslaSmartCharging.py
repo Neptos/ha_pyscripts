@@ -20,7 +20,6 @@ Create these helpers in Home Assistant BEFORE deploying this script:
        1 = Scheduled charging (waiting for slot)
        2 = Active charging (grid power)
        3 = Active charging (solar surplus)
-       4 = Paused (waiting for cheaper rate)
        5 = Complete (target SOC reached)
       -1 = Error/Unavailable
 
@@ -108,7 +107,7 @@ entity IDs before deployment.
 ================================================================================
 """
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 import json
 
 # =============================================================================
@@ -141,8 +140,23 @@ MIN_SOC_GUARANTEE = 50  # Minimum SOC (%) guaranteed by deadline
 CHARGE_DEADLINE_HOUR = 7  # Deadline hour (7:00 AM)
 CHARGE_DEADLINE_MINUTE = 0  # Deadline minute
 
+# --- Slot Timing ---
+SLOT_DURATION_HOURS = 0.25  # 15 minutes per Nordpool slot
+SLOT_DURATION = timedelta(minutes=15)
+
 # --- Cold Weather Buffer ---
 OUTDOOR_TEMP_SENSOR = "sensor.nibe_utetemperatur_bt1"  # Nibe heat pump outdoor temp
+COLD_WEATHER_TEMP_C = 0.0      # Below this, +1 mandatory slot
+EXTREME_COLD_TEMP_C = -10.0    # Below this, +2 mandatory slots
+
+# --- Consolidation Tolerance ---
+# Max price factor over original before refusing a consolidation relocation
+CONSOLIDATION_PRICE_TOLERANCE = 2.0
+
+# --- Solar "significant" thresholds (kWh per slot) ---
+# INTENTIONALLY different: counting-vs-display semantics
+SOLAR_SLOT_COUNT_THRESHOLD_KWH = 0.1    # "slot has some solar" for counting
+SOLAR_STATUS_DISPLAY_THRESHOLD_KWH = 0.5  # "slot has substantial solar" for UI status
 
 # --- Solar Charging Parameters ---
 # Minimum charge power: 5A * 230V * 3 phases = 3450W (pure-solar sustain threshold)
@@ -180,12 +194,9 @@ SELL_PRICE_SENSOR = "sensor.electricity_sell_price"
 
 # --- Solar Forecast Entities (Solcast) ---
 SOLAR_REMAINING_TODAY = "sensor.energy_production_today_remaining"
-SOLAR_CURRENT_HOUR = "sensor.energy_current_hour"
-SOLAR_NEXT_HOUR = "sensor.energy_next_hour"
 SOLAR_PRODUCTION_TOMORROW = "sensor.energy_production_tomorrow"
 
 # --- Solar Production/Grid Entities ---
-SOLAR_POWER_CURRENT = "sensor.inverter_average_active_power"
 GRID_POWER_CURRENT = "sensor.power_meter_active_power"
 GRID_POWER_15MIN_AVG = "sensor.power_meter_active_power_15min"
 
@@ -195,7 +206,6 @@ SUN_NEXT_SETTING = "sensor.sun_next_setting"
 
 # --- Output Entities (create as HA helpers) ---
 OUTPUT_CHARGING_STATUS = "input_number.tesla_charging_status"
-OUTPUT_CHARGING_SCHEDULE = "input_text.tesla_charging_schedule"
 OUTPUT_SMART_CHARGING_ENABLED = "input_boolean.tesla_smart_charging_enabled"
 OUTPUT_MAX_AVG_PRICE = "input_number.tesla_max_avg_price"
 OUTPUT_SOLAR_AVAILABLE = "input_select.tesla_solar_charging_available"
@@ -245,6 +255,36 @@ def _normalize_price_data(price_dictionaries):
             normalized.append(entry)
 
     return normalized
+
+
+def _find_price_at_slot(normalized_prices, slot_start):
+    """Find the price value whose slot starts at `slot_start`.
+
+    Handles string vs datetime `start`, ensures timezone-awareness, compares
+    as UTC moments (DST-safe).
+
+    Returns:
+        float: matched price value, or None if no matching entry.
+    """
+    for entry in normalized_prices:
+        if 'start' not in entry or 'value' not in entry:
+            continue
+
+        entry_start = entry['start']
+        if isinstance(entry_start, str):
+            entry_start = datetime.fromisoformat(entry_start.replace('Z', '+00:00'))
+        elif hasattr(entry_start, 'timestamp'):
+            if entry_start.tzinfo is None:
+                entry_start = entry_start.astimezone()
+
+        entry_start_local = entry_start.astimezone(slot_start.tzinfo)
+
+        if entry_start_local == slot_start:
+            try:
+                return float(entry['value'])
+            except (ValueError, TypeError):
+                return None
+    return None
 
 
 def _get_sunrise_sunset():
@@ -375,29 +415,7 @@ def _get_current_prices():
         normalized_prices = _normalize_price_data(raw_today)
 
         # Find buy price for current slot
-        buy_price = None
-        for entry in normalized_prices:
-            if 'start' not in entry or 'value' not in entry:
-                continue
-
-            # Parse start time - handle both string and datetime objects
-            entry_start = entry['start']
-            if isinstance(entry_start, str):
-                entry_start = datetime.fromisoformat(entry_start.replace('Z', '+00:00'))
-            elif hasattr(entry_start, 'timestamp'):
-                # It's already a datetime, ensure timezone-aware
-                if entry_start.tzinfo is None:
-                    entry_start = entry_start.astimezone()
-
-            # Compare slot starts (both should be timezone-aware now)
-            # Convert both to same timezone for comparison
-            entry_start_local = entry_start.astimezone(slot_start.tzinfo)
-
-            if (entry_start_local.hour == slot_start.hour and
-                entry_start_local.minute == slot_start.minute and
-                entry_start_local.date() == slot_start.date()):
-                buy_price = float(entry['value'])
-                break
+        buy_price = _find_price_at_slot(normalized_prices, slot_start)
 
         if buy_price is None:
             log.warning(f"Could not find buy price for slot starting at {slot_start}")
@@ -411,24 +429,7 @@ def _get_current_prices():
         if sell_raw_today:
             # Try to find time-specific sell price
             sell_normalized = _normalize_price_data(sell_raw_today)
-            for entry in sell_normalized:
-                if 'start' not in entry or 'value' not in entry:
-                    continue
-
-                entry_start = entry['start']
-                if isinstance(entry_start, str):
-                    entry_start = datetime.fromisoformat(entry_start.replace('Z', '+00:00'))
-                elif hasattr(entry_start, 'timestamp'):
-                    if entry_start.tzinfo is None:
-                        entry_start = entry_start.astimezone()
-
-                entry_start_local = entry_start.astimezone(slot_start.tzinfo)
-
-                if (entry_start_local.hour == slot_start.hour and
-                    entry_start_local.minute == slot_start.minute and
-                    entry_start_local.date() == slot_start.date()):
-                    sell_price = float(entry['value'])
-                    break
+            sell_price = _find_price_at_slot(sell_normalized, slot_start)
 
         # Fall back to current state value if time-varying not found
         if sell_price is None:
@@ -506,47 +507,46 @@ def _calculate_blended_effective_price(excess_solar_w, buy_price, sell_price):
 
 
 def _is_price_cheap(price):
-    """Check if the given price is cheaper than the scheduled charging average.
+    """Check whether `price` (c/kWh) is below the blended price threshold.
 
-    Compares the blended effective price against the average price of the
-    current charging schedule. Only charge blended if it's actually cheaper
-    than what we'd pay during scheduled slots.
-
-    Args:
-        price: Current blended effective price in c/kWh to evaluate
-
-    Returns:
-        bool: True if price is below scheduled average, False otherwise.
-              Returns False if price is None or no schedule data available.
+    Threshold source order: scheduled avg → configured max → None.
+    Returns False if `price` is None or no threshold is configured.
+    See `_get_blended_price_threshold` for threshold computation.
     """
     if price is None:
-        log.debug("_is_price_cheap: price is None, returning False")
         return False
+    threshold = _get_blended_price_threshold()
+    if threshold is None:
+        return False
+    is_cheap = price < threshold
+    log.debug(f"_is_price_cheap: price={price:.2f} c/kWh, "
+              f"threshold={threshold:.2f} c/kWh, is_cheap={is_cheap}")
+    return is_cheap
 
+
+def _get_blended_price_threshold():
+    """Compute the threshold price below which blended solar+grid is 'cheap'.
+
+    Uses the scheduled-average price from the stored charging status if
+    available, else falls back to the user-configured max average price.
+    Returns None when neither is set (blended tier is then never selected).
+    """
     try:
         attrs = state.getattr(OUTPUT_CHARGING_STATUS) or {}
         scheduled_avg = attrs.get("avg_price_c_kwh")
+        if scheduled_avg is not None and float(scheduled_avg) > 0:
+            return float(scheduled_avg)
+    except (ValueError, TypeError):
+        pass
 
-        if scheduled_avg is None or float(scheduled_avg) <= 0:
-            # No schedule — fall back to configured max avg price
-            max_avg = float(state.get(OUTPUT_MAX_AVG_PRICE) or 0)
-            if max_avg <= 0:
-                log.debug("_is_price_cheap: No scheduled avg and no max avg price configured")
-                return False
-            threshold = max_avg
-        else:
-            threshold = float(scheduled_avg)
+    try:
+        max_avg = float(state.get(OUTPUT_MAX_AVG_PRICE) or 0)
+    except (ValueError, TypeError):
+        max_avg = 0
+    if max_avg > 0:
+        return max_avg
 
-        is_cheap = price < threshold
-
-        log.debug(f"_is_price_cheap: blended={price:.2f} c/kWh, threshold={threshold:.2f} c/kWh, "
-                  f"is_cheap={is_cheap}")
-
-        return is_cheap
-
-    except Exception as e:
-        log.warning(f"_is_price_cheap: Error: {e}")
-        return False
+    return None
 
 
 def _is_during_daylight():
@@ -662,15 +662,13 @@ def _calculate_effective_price(slot_start, buy_price, sell_price):
             - grid_energy_kwh: kWh that must come from grid
     """
     # Energy charged in a 15-min slot at max rate
-    slot_duration_hours = 0.25
-    max_slot_energy_kwh = MAX_CHARGE_RATE_KW * slot_duration_hours
+    max_slot_energy_kwh = MAX_CHARGE_RATE_KW * SLOT_DURATION_HOURS
 
     # Get available solar power for this slot
     solar_available_kw = _get_solar_forecast_for_slot(slot_start)
 
     # Calculate how much of the charging can be covered by solar
-    # Solar available in kW, slot is 0.25 hours, so solar energy = kW * 0.25
-    solar_energy_kwh = min(solar_available_kw * slot_duration_hours, max_slot_energy_kwh)
+    solar_energy_kwh = min(solar_available_kw * SLOT_DURATION_HOURS, max_slot_energy_kwh)
     grid_energy_kwh = max_slot_energy_kwh - solar_energy_kwh
 
     # Calculate effective price
@@ -680,16 +678,14 @@ def _calculate_effective_price(slot_start, buy_price, sell_price):
     # Effective cost for solar portion = sell_price (opportunity cost)
     # Effective cost for grid portion = buy_price
 
-    if max_slot_energy_kwh > 0:
-        solar_fraction = solar_energy_kwh / max_slot_energy_kwh
-        grid_fraction = grid_energy_kwh / max_slot_energy_kwh
+    # max_slot_energy_kwh is MAX_CHARGE_RATE_KW * SLOT_DURATION_HOURS (both positive)
+    solar_fraction = solar_energy_kwh / max_slot_energy_kwh
+    grid_fraction = grid_energy_kwh / max_slot_energy_kwh
 
-        # Blended effective price
-        # Solar part: opportunity cost is sell_price (what we give up by not exporting)
-        # Grid part: actual cost is buy_price
-        effective_price = (solar_fraction * sell_price) + (grid_fraction * buy_price)
-    else:
-        effective_price = buy_price
+    # Blended effective price
+    # Solar part: opportunity cost is sell_price (what we give up by not exporting)
+    # Grid part: actual cost is buy_price
+    effective_price = (solar_fraction * sell_price) + (grid_fraction * buy_price)
 
     return (effective_price, solar_energy_kwh, grid_energy_kwh)
 
@@ -757,14 +753,16 @@ def _build_slot_list_with_effective_prices():
                     sell_lookup[start_dt.isoformat()] = entry['value']
 
         # Flat rate fallback for sell price
-        sell_price_flat = float(state.get(SELL_PRICE_SENSOR) or 0)
+        try:
+            sell_price_flat = float(state.get(SELL_PRICE_SENSOR) or 0)
+        except (ValueError, TypeError):
+            sell_price_flat = 0
 
         # Current time for filtering past slots
         now = datetime.now().astimezone()
 
         # Build slot list
-        slot_duration_hours = 0.25
-        max_slot_energy = MAX_CHARGE_RATE_KW * slot_duration_hours
+        max_slot_energy = MAX_CHARGE_RATE_KW * SLOT_DURATION_HOURS
 
         for price_entry in all_prices:
             if 'start' not in price_entry or 'value' not in price_entry:
@@ -786,7 +784,7 @@ def _build_slot_list_with_effective_prices():
                 elif not hasattr(end, 'tzinfo') or end.tzinfo is None:
                     end = end.astimezone()
             else:
-                end = start + timedelta(minutes=15)
+                end = start + SLOT_DURATION
 
             # Skip past-ended slots AND the current partial slot (only count full 15-min slots)
             if start < now:
@@ -950,7 +948,7 @@ def _consolidate_slots(selected_slots, all_slots, deadline, mandatory_starts):
         groups = []
         current_group = [sorted_starts[0]]
         for i in range(1, len(sorted_starts)):
-            if sorted_starts[i] - sorted_starts[i - 1] == timedelta(minutes=15):
+            if sorted_starts[i] - sorted_starts[i - 1] == SLOT_DURATION:
                 current_group.append(sorted_starts[i])
             else:
                 groups.append(current_group)
@@ -965,9 +963,9 @@ def _consolidate_slots(selected_slots, all_slots, deadline, mandatory_starts):
             if group is target_group:
                 continue
             # Slot just before the group
-            before = min(group) - timedelta(minutes=15)
+            before = min(group) - SLOT_DURATION
             # Slot just after the group
-            after = max(group) + timedelta(minutes=15)
+            after = max(group) + SLOT_DURATION
             for adj_start in [before, after]:
                 if adj_start in selected_starts:
                     continue  # Already selected
@@ -1002,7 +1000,7 @@ def _consolidate_slots(selected_slots, all_slots, deadline, mandatory_starts):
                 if replacement is None:
                     continue
                 slot_obj = slot_lookup[slot_start]
-                if replacement['effective_price'] > slot_obj['effective_price'] * 2:
+                if replacement['effective_price'] > slot_obj['effective_price'] * CONSOLIDATION_PRICE_TOLERANCE:
                     continue
                 # Swap: deselect original, select replacement
                 selected_starts.discard(slot_start)
@@ -1057,7 +1055,7 @@ def _apply_price_ceiling(mandatory_slots, optional_slots, max_avg_price):
     return optional
 
 
-def _store_schedule(schedule_slots, mode="scheduled", current_soc=None):
+def _store_schedule(schedule_slots, mode, current_soc=None):
     """Store the charging schedule to Home Assistant entities.
 
     Stores the schedule as JSON in the input_text entity, with metadata
@@ -1065,7 +1063,9 @@ def _store_schedule(schedule_slots, mode="scheduled", current_soc=None):
 
     Args:
         schedule_slots: List of selected slot dictionaries
-        mode: Charging mode string (e.g., "scheduled", "immediate", "solar")
+        mode: Charging mode string. Emitted values: "complete", "idle",
+            "scheduled_mandatory", "scheduled_optional",
+            "scheduled_mandatory_optional".
         current_soc: Current battery SOC (%) for calculating expected resulting SOC
     """
     try:
@@ -1095,7 +1095,7 @@ def _store_schedule(schedule_slots, mode="scheduled", current_soc=None):
             total_weighted_price += slot['effective_price'] * slot['energy']
 
             # Count slots with significant solar contribution
-            if slot['solar_energy'] > 0.1:
+            if slot['solar_energy'] > SOLAR_SLOT_COUNT_THRESHOLD_KWH:
                 solar_slots_count += 1
 
         # Sort by start time for storage (even though we selected by price)
@@ -1265,7 +1265,6 @@ def _calculate_and_store_schedule():
 
         # Get next deadline
         deadline = _get_next_deadline()
-        now = datetime.now().astimezone()
 
         log.info(f"Next deadline: {deadline.strftime('%Y-%m-%d %H:%M')}")
 
@@ -1294,9 +1293,9 @@ def _calculate_and_store_schedule():
             except (ValueError, TypeError):
                 temp = None
 
-            extra_slots = 1 if temp is None else 2 if temp < -10 else 1 if temp < 0 else 0
+            extra_slots = 1 if temp is None else 2 if temp < EXTREME_COLD_TEMP_C else 1 if temp < COLD_WEATHER_TEMP_C else 0
             if extra_slots > 0:
-                slot_energy = MAX_CHARGE_RATE_KW * 0.25  # kWh per 15-min slot
+                slot_energy = MAX_CHARGE_RATE_KW * SLOT_DURATION_HOURS  # kWh per 15-min slot
                 cold_weather_extra = extra_slots * slot_energy
                 mandatory_energy_needed += cold_weather_extra
                 log.info(f"Cold weather: {temp}°C -> +{extra_slots} slots ({cold_weather_extra:.2f} kWh)")
@@ -1464,7 +1463,6 @@ def _update_charging_status(status_code, message=""):
         1 = Scheduled charging (waiting)
         2 = Active charging (grid)
         3 = Active charging (solar surplus)
-        4 = Paused (waiting for cheaper rate)
         5 = Complete (target reached)
         -1 = Error/Unavailable
 
@@ -1679,6 +1677,7 @@ def _compute_desired_action(
     surplus_watts,
     buy_price,
     sell_price,
+    price_threshold=None,
 ):
     """Determine desired charging action from current conditions.
 
@@ -1692,8 +1691,12 @@ def _compute_desired_action(
       2. Outside daylight -> stop or wait
       3. Pure solar sustain (already charging, surplus >= MIN_CHARGE_POWER_W)
       4. Pure solar start (not charging, surplus >= SOLAR_START_THRESHOLD_W)
-      5. Blended (surplus >= SOLAR_BLENDED_MIN_W and price cheap) -> MIN_CHARGE_AMPS
+      5. Blended (surplus >= SOLAR_BLENDED_MIN_W and effective_price < price_threshold) -> MIN_CHARGE_AMPS
       6. Else -> stop or noop
+
+    Pure function: all inputs passed as arguments, no state reads.
+    `price_threshold` (c/kWh) is the cutoff for blended-tier selection;
+    when None, blended tier is never chosen.
     """
     # Scheduled slot: max amps, preempts solar
     if is_in_slot:
@@ -1735,7 +1738,7 @@ def _compute_desired_action(
         effective_price = _calculate_blended_effective_price(
             surplus_watts, buy_price, sell_price or 0
         )
-        if _is_price_cheap(effective_price):
+        if price_threshold is not None and effective_price < price_threshold:
             return {
                 'type': 'charge',
                 'amps': MIN_CHARGE_AMPS,
@@ -1753,57 +1756,68 @@ def _compute_desired_action(
     return {'type': 'noop', 'status_code': 0, 'status_msg': 'No charging conditions met'}
 
 
-def _get_effective_surplus(is_charging):
+def _get_effective_surplus(is_charging, grid_power_instant, grid_power_avg, tesla_power_w):
     """Compute surplus for charging decisions.
 
     When charging: instantaneous grid_power + tesla_power (real-time, no averaging lag).
     When not charging: 15-min averaged grid power (debounces transients).
 
+    See the "Surplus model (intentional asymmetry)" comment block in
+    `tesla_charging_control` for the rationale vs `_update_solar_availability_indicator`.
+
     Grid power convention: positive = exporting (surplus), negative = importing.
 
+    Args:
+        is_charging: Whether Tesla is currently drawing power.
+        grid_power_instant: Instantaneous grid export in W (positive = exporting).
+        grid_power_avg: 15-min averaged grid export in W.
+        tesla_power_w: Current Tesla charger draw in W (already converted from kW).
+
     Returns:
-        float: Effective surplus in watts (0.0 on sensor error).
+        float: Effective surplus in watts.
     """
-    try:
-        if is_charging:
-            grid_power = float(state.get(GRID_POWER_CURRENT) or 0)
-            tesla_power_w = float(state.get(TESLA_CHARGER_POWER) or 0) * 1000
-            return grid_power + tesla_power_w
-        return float(state.get(GRID_POWER_15MIN_AVG) or 0)
-    except (ValueError, TypeError):
-        return 0.0
+    if is_charging:
+        return grid_power_instant + tesla_power_w
+    return grid_power_avg
 
 
-def _update_solar_availability_indicator(is_charging):
+def _update_solar_availability_indicator(is_charging, is_daylight, grid_power_avg,
+                                         tesla_power_w, buy_price, sell_price):
     """Update input_select.tesla_solar_charging_available.
 
     Indicator answers: "would solar charging start if I plugged in now?"
     When already charging, adds back Tesla draw so the value reflects true
-    available surplus (not post-Tesla consumption).
+    available surplus (not post-Tesla consumption). Always uses the 15-min
+    average (a start-decision), regardless of `is_charging`.
+
+    See the "Surplus model (intentional asymmetry)" comment block in
+    `tesla_charging_control` for the rationale vs `_get_effective_surplus`.
 
     Called independently of car gates so the dashboard shows solar availability
     regardless of car location / cable state. Off outside daylight.
+
+    Args:
+        is_charging: Whether Tesla is currently drawing power.
+        is_daylight: Whether the sun is up (indicator is 'off' otherwise).
+        grid_power_avg: 15-min averaged grid export in W.
+        tesla_power_w: Current Tesla charger draw in W.
+        buy_price: Current buy price (c/kWh) or None.
+        sell_price: Current sell price (c/kWh) or None.
     """
-    if not _is_during_daylight():
+    if not is_daylight:
         input_select.select_option(entity_id=OUTPUT_SOLAR_AVAILABLE, option='off')
         return
 
-    try:
-        if is_charging:
-            tesla_power_w = float(state.get(TESLA_CHARGER_POWER) or 0) * 1000
-            available = float(state.get(GRID_POWER_15MIN_AVG) or 0) + tesla_power_w
-        else:
-            available = float(state.get(GRID_POWER_15MIN_AVG) or 0)
-    except (ValueError, TypeError):
-        input_select.select_option(entity_id=OUTPUT_SOLAR_AVAILABLE, option='off')
-        return
+    if is_charging:
+        available = grid_power_avg + tesla_power_w
+    else:
+        available = grid_power_avg
 
     if available >= SOLAR_START_THRESHOLD_W:
         input_select.select_option(entity_id=OUTPUT_SOLAR_AVAILABLE, option='pure')
         return
 
     if available >= SOLAR_BLENDED_MIN_W:
-        buy_price, sell_price = _get_current_prices()
         if buy_price is not None:
             eff = _calculate_blended_effective_price(available, buy_price, sell_price or 0)
             if _is_price_cheap(eff):
@@ -1890,7 +1904,36 @@ def tesla_charging_control():
         return
 
     is_charging = _is_currently_charging()
-    _update_solar_availability_indicator(is_charging)
+
+    # Gather shared state once per tick — passed into helpers to avoid redundant reads.
+    # is_daylight is cheap; grid and tesla power are single lookups; prices are only
+    # fetched when daylight (the scheduled-slot path below never needs them).
+    #
+    # Surplus model (intentional asymmetry):
+    #   - Controller uses instantaneous grid + Tesla draw when ALREADY charging
+    #     (real-time, no averaging lag). Uses 15-min avg otherwise (stable).
+    #   - Indicator always uses 15-min avg + Tesla draw (represents the
+    #     "would solar start if plugged in now?" question — a start decision).
+    is_daylight = _is_during_daylight()
+    try:
+        grid_power_instant = float(state.get(GRID_POWER_CURRENT) or 0)
+    except (ValueError, TypeError):
+        grid_power_instant = 0.0
+    try:
+        grid_power_avg = float(state.get(GRID_POWER_15MIN_AVG) or 0)
+    except (ValueError, TypeError):
+        grid_power_avg = 0.0
+    try:
+        tesla_power_w = float(state.get(TESLA_CHARGER_POWER) or 0) * 1000
+    except (ValueError, TypeError):
+        tesla_power_w = 0.0
+
+    buy_price, sell_price = (None, None)
+    if is_daylight:
+        buy_price, sell_price = _get_current_prices()
+
+    _update_solar_availability_indicator(is_charging, is_daylight, grid_power_avg,
+                                         tesla_power_w, buy_price, sell_price)
 
     if not _is_car_at_home() or not _is_cable_connected():
         return
@@ -1913,12 +1956,10 @@ def tesla_charging_control():
         current_amps = int(float(state.get(TESLA_CHARGE_CURRENT) or 0))
     except (ValueError, TypeError):
         current_amps = 0
-    is_daylight = _is_during_daylight()
-    surplus_watts = _get_effective_surplus(is_charging)
-    buy_price, sell_price = (None, None)
-    if is_daylight:
-        buy_price, sell_price = _get_current_prices()
+    surplus_watts = _get_effective_surplus(is_charging, grid_power_instant,
+                                           grid_power_avg, tesla_power_w)
 
+    price_threshold = _get_blended_price_threshold() if is_daylight else None
     action = _compute_desired_action(
         is_in_slot=is_in_slot,
         is_charging=is_charging,
@@ -1926,6 +1967,7 @@ def tesla_charging_control():
         surplus_watts=surplus_watts,
         buy_price=buy_price,
         sell_price=sell_price,
+        price_threshold=price_threshold,
     )
 
     if action['type'] == 'charge':
@@ -1933,7 +1975,7 @@ def tesla_charging_control():
         # Refine scheduled-slot status based on solar content of current slot
         if is_in_slot and current_slot:
             solar_energy = current_slot.get('solar_energy', 0)
-            status_code = 3 if solar_energy > 0.5 else 2
+            status_code = 3 if solar_energy > SOLAR_STATUS_DISPLAY_THRESHOLD_KWH else 2
 
         if not is_charging:
             _start_charging(action['amps'])
@@ -1986,6 +2028,10 @@ def on_car_arrives_home():
     reported the location change.
     """
     log.info("Tesla arrived home - recalculating schedule")
+
+    if not _is_smart_charging_enabled():
+        log.debug("Smart charging disabled, skipping arrival handler")
+        return
 
     task.sleep(60)
 
@@ -2093,8 +2139,14 @@ def teslaSmartChargingTestService(action=None, id=None):
         log.info(f"Solar forecast for current slot: {solar_kw:.2f} kW")
 
         # Test effective price calculation
-        buy_price = float(state.get(NORDPOOL_SENSOR) or 0.10)
-        sell_price = float(state.get(SELL_PRICE_SENSOR) or 0.05)
+        try:
+            buy_price = float(state.get(NORDPOOL_SENSOR) or 10.0)
+        except (ValueError, TypeError):
+            buy_price = 10.0
+        try:
+            sell_price = float(state.get(SELL_PRICE_SENSOR) or 5.0)
+        except (ValueError, TypeError):
+            sell_price = 5.0
         eff_price, solar_e, grid_e = _calculate_effective_price(now, buy_price, sell_price)
         log.info(f"Effective price: {eff_price:.4f} c/kWh (solar: {solar_e:.2f} kWh, grid: {grid_e:.2f} kWh)")
 
@@ -2154,12 +2206,12 @@ def teslaSmartChargingTestService(action=None, id=None):
                 solar_frac = min(surplus / MIN_CHARGE_POWER_W, 1.0) * 100
                 log.info(f"  {surplus}W surplus: {eff:.4f} c/kWh ({solar_frac:.0f}% solar)")
 
-            # Test with known prices
+            # Test with known prices (c/kWh scale)
             log.info(f"_is_price_cheap() tests:")
-            log.info(f"  Price 0.01: cheap = {_is_price_cheap(0.01)}")
-            log.info(f"  Price 0.05: cheap = {_is_price_cheap(0.05)}")
-            log.info(f"  Price 0.10: cheap = {_is_price_cheap(0.10)}")
-            log.info(f"  Price 0.20: cheap = {_is_price_cheap(0.20)}")
+            log.info(f"  Price 1.0 c/kWh: cheap = {_is_price_cheap(1.0)}")
+            log.info(f"  Price 5.0 c/kWh: cheap = {_is_price_cheap(5.0)}")
+            log.info(f"  Price 10.0 c/kWh: cheap = {_is_price_cheap(10.0)}")
+            log.info(f"  Price 20.0 c/kWh: cheap = {_is_price_cheap(20.0)}")
     except Exception as e:
         log.warning(f"Error testing blended pricing functions: {e}")
 
@@ -2174,7 +2226,24 @@ def teslaSmartChargingTestService(action=None, id=None):
             is_in_slot_now, _ = _is_current_time_in_scheduled_slot(schedule_now)
         is_charging_now = _is_currently_charging()
         is_daylight_now = _is_during_daylight()
-        surplus_now = _get_effective_surplus(is_charging_now)
+        try:
+            grid_power_instant_test = float(state.get(GRID_POWER_CURRENT) or 0)
+        except (ValueError, TypeError):
+            grid_power_instant_test = 0.0
+        try:
+            grid_power_avg_test = float(state.get(GRID_POWER_15MIN_AVG) or 0)
+        except (ValueError, TypeError):
+            grid_power_avg_test = 0.0
+        try:
+            tesla_power_w_test = float(state.get(TESLA_CHARGER_POWER) or 0) * 1000
+        except (ValueError, TypeError):
+            tesla_power_w_test = 0.0
+        surplus_now = _get_effective_surplus(
+            is_charging_now,
+            grid_power_instant_test,
+            grid_power_avg_test,
+            tesla_power_w_test,
+        )
         buy_now, sell_now = _get_current_prices() if is_daylight_now else (None, None)
 
         action = _compute_desired_action(
@@ -2184,6 +2253,7 @@ def teslaSmartChargingTestService(action=None, id=None):
             surplus_watts=surplus_now,
             buy_price=buy_now,
             sell_price=sell_now,
+            price_threshold=_get_blended_price_threshold() if is_daylight_now else None,
         )
         log.info(f"Current decision: {action}")
     except Exception as e:
