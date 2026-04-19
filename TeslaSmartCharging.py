@@ -52,19 +52,23 @@ KEY FEATURES
      Pass 2 (Optional): Select cheapest remaining slots to reach charge_limit
    - 15-minute slot granularity matching Nordpool pricing
 
-2. SOLAR OPPORTUNISTIC CHARGING
-   - Monitors grid power export during daylight hours
-   - Three-tier logic:
-     * PURE solar (>=4500W surplus): Charges using 100% solar at calculated amps
-     * BLENDED (1500-4500W surplus): Charges at min amps if grid price is cheap (<75% avg)
-     * STOP (<1500W surplus): Stops opportunistic charging
-   - 5-minute minimum interval between charge state changes prevents rapid cycling
-   - Does not interfere with scheduled slots
+2. UNIFIED CHARGING CONTROLLER
+   - Single state-based decision loop at cron(*/15 * * * *)
+   - Every tick re-derives the desired action from current conditions (no history
+     or ownership flags)
+   - Decision precedence: scheduled slot > pure solar sustain > pure solar start
+     > blended > stop
+   - Pure solar sustains down to MIN_CHARGE_AMPS (5A); only drops to blended/stop
+     when surplus falls below MIN_CHARGE_POWER_W (3450W)
+   - Blended tier: partial solar + grid at MIN_CHARGE_AMPS when price is cheap
+   - Solar availability indicator updated each tick before car-specific gates
+   - Manual override: toggle input_boolean.tesla_smart_charging_enabled off
 
 3. AUTOMATIC REPLANNING
-   - Recalculates schedule when car arrives home
+   - Recalculates schedule when car arrives home (device_tracker state change)
    - Recalculates schedule when charging cable is connected
-   - Stops Tesla's auto-start charging if outside scheduled slot
+   - After recalculation, the unified controller runs immediately to act on
+     current conditions (no waiting for next 15-minute tick)
 
 ================================================================================
 GRID POWER CONVENTION
@@ -81,19 +85,17 @@ TRIGGER SCHEDULE SUMMARY
 ================================================================================
 
 Time Triggers:
-  - cron(0 15 * * *)     : Daily schedule calculation (15:00)
-  - cron(2,17,32,47 * * * *): Schedule execution every 15 minutes
-  - cron(*/15 * * * *)   : Solar opportunistic charging check every 15 minutes
+  - cron(0 15 * * *)    : Daily schedule calculation (15:00)
+  - cron(*/15 * * * *)  : Unified charging controller (every 15 minutes)
 
 State Triggers:
-  - input_boolean.tesla_smart_charging_enabled == 'on': Smart charging enabled -> calculate
-  - binary_sensor.tesla_wall_connector_vehicle_connected == 'on': Wall connector detects
-      vehicle (instant, local) -> wake Tesla integration, calculate, stop auto-charge
-  - device_tracker.location == 'home' : Car arrives home -> recalculate schedule
-  - binary_sensor.charge_cable == 'on': Cable connected (cloud) -> recalculate schedule
+  - input_boolean.tesla_smart_charging_enabled == 'on': calculate schedule + immediate control
+  - device_tracker.location == 'home': calculate schedule on arrival
+  - binary_sensor.charge_cable == 'on': calculate schedule + immediate control
 
 Services:
   - pyscript.calculate_tesla_charging_schedule : Manual schedule calculation
+  - pyscript.tesla_charging_control            : Manual controller tick
   - pyscript.tesla_smart_charging_test_service : Debug/test service
 
 ================================================================================
@@ -138,17 +140,16 @@ PHASES = 3  # 3-phase charging
 MIN_SOC_GUARANTEE = 50  # Minimum SOC (%) guaranteed by deadline
 CHARGE_DEADLINE_HOUR = 7  # Deadline hour (7:00 AM)
 CHARGE_DEADLINE_MINUTE = 0  # Deadline minute
-MIN_CHANGE_INTERVAL_SECONDS = 300  # Minimum 5 minutes between charge adjustments
 
 # --- Cold Weather Buffer ---
 OUTDOOR_TEMP_SENSOR = "sensor.nibe_utetemperatur_bt1"  # Nibe heat pump outdoor temp
 
 # --- Solar Charging Parameters ---
-# Minimum charge power: 6A * 230V * 3 phases = 4140W
+# Minimum charge power: 5A * 230V * 3 phases = 3450W (pure-solar sustain threshold)
 MIN_CHARGE_POWER_W = MIN_CHARGE_AMPS * VOLTAGE * PHASES
 
 # Solar Charging Thresholds
-SOLAR_START_THRESHOLD_W = 4500  # Pure solar: surplus covers full minimum charge power (4140W + margin)
+SOLAR_START_THRESHOLD_W = 4500  # Pure solar: surplus covers full minimum charge power (3450W + margin)
 
 # Blended Solar+Grid Charging Parameters
 SOLAR_BLENDED_MIN_W = 1500  # Minimum solar surplus for blended solar+grid charging
@@ -461,7 +462,7 @@ def _calculate_blended_effective_price(excess_solar_w, buy_price, sell_price):
     of solar and grid power. Used for real-time charging decisions.
 
     The blending logic:
-    - If excess_solar >= MIN_CHARGE_POWER_W (4140W): Pure solar charging,
+    - If excess_solar >= MIN_CHARGE_POWER_W (3450W): Pure solar charging,
       effective price = sell_price (opportunity cost of not exporting)
     - Otherwise: Weighted average based on solar fraction
       effective_price = (solar_fraction * sell_price) + (grid_fraction * buy_price)
@@ -787,8 +788,8 @@ def _build_slot_list_with_effective_prices():
             else:
                 end = start + timedelta(minutes=15)
 
-            # Skip slots in the past
-            if end <= now:
+            # Skip past-ended slots AND the current partial slot (only count full 15-min slots)
+            if start < now:
                 continue
 
             buy_price = float(price_entry['value'])
@@ -1512,7 +1513,6 @@ def _start_charging(amps):
         switch.turn_on(entity_id=TESLA_CHARGE_SWITCH)
 
         # Record that we started charging (for tracking)
-        state.setattr(OUTPUT_CHARGING_STATUS + ".charging_started_by", "smart_charging")
         state.setattr(OUTPUT_CHARGING_STATUS + ".charging_started_at", datetime.now().isoformat())
         state.setattr(OUTPUT_CHARGING_STATUS + ".charging_amps", amps)
 
@@ -1537,7 +1537,6 @@ def _stop_charging():
         switch.turn_off(entity_id=TESLA_CHARGE_SWITCH)
 
         state.setattr(OUTPUT_CHARGING_STATUS + ".charging_stopped_at", datetime.now().isoformat())
-        state.setattr(OUTPUT_CHARGING_STATUS + ".charging_started_by", "none")
 
         return True
 
@@ -1585,7 +1584,6 @@ def _is_currently_charging():
 
     Returns:
         bool: True if actively charging, False otherwise.
-              Warning logged if charging state data is stale (>60s old).
     """
     try:
         charging_state = state.get(TESLA_CHARGING_STATE)
@@ -1657,138 +1655,6 @@ def _is_current_time_in_scheduled_slot(schedule):
         return False, None
 
 
-def _is_in_scheduled_slot():
-    """Check if we are currently in a scheduled charging slot.
-
-    Convenience wrapper that retrieves the schedule and checks slot.
-
-    Returns:
-        bool: True if current time is in a scheduled charging slot
-    """
-    schedule = _get_stored_schedule()
-    if not schedule:
-        return False
-
-    is_in_slot, _ = _is_current_time_in_scheduled_slot(schedule)
-    return is_in_slot
-
-
-def _get_last_solar_change_time():
-    """Get the timestamp of the last solar opportunistic charging change.
-
-    Returns:
-        datetime: Last change time or None if not set
-    """
-    try:
-        attrs = state.getattr(OUTPUT_CHARGING_STATUS) or {}
-        last_change = attrs.get("solar_last_change")
-        if last_change:
-            return datetime.fromisoformat(last_change)
-        return None
-    except Exception as e:
-        log.warning(f"Error getting last solar change time: {e}")
-        return None
-
-
-def _set_last_solar_change_time():
-    """Record the current time as the last solar opportunistic charging change."""
-    try:
-        state.setattr(OUTPUT_CHARGING_STATUS + ".solar_last_change", datetime.now().isoformat())
-    except Exception as e:
-        log.warning(f"Error setting last solar change time: {e}")
-
-
-def _is_solar_change_allowed():
-    """Check if enough time has passed since last solar charge adjustment.
-
-    Enforces MIN_CHANGE_INTERVAL_SECONDS between solar charging changes
-    to prevent rapid on/off cycling.
-
-    Returns:
-        bool: True if a change is allowed, False if still in cooldown
-    """
-    last_change = _get_last_solar_change_time()
-    if last_change is None:
-        return True
-
-    now = datetime.now().astimezone()
-    elapsed = (now - last_change.astimezone()).total_seconds()
-    return elapsed >= MIN_CHANGE_INTERVAL_SECONDS
-
-
-
-def _is_in_opportunistic_solar_mode():
-    """Check if currently in opportunistic solar charging mode.
-
-    Returns:
-        bool: True if charging was started for solar opportunism
-    """
-    try:
-        attrs = state.getattr(OUTPUT_CHARGING_STATUS) or {}
-        started_by = attrs.get("charging_started_by")
-        return started_by == "solar_opportunistic"
-    except Exception as e:
-        log.warning(f"Error checking solar mode: {e}")
-        return False
-
-
-def _start_solar_opportunistic_charging(amps):
-    """Start solar opportunistic charging.
-
-    Similar to _start_charging but marks the session as solar opportunistic.
-
-    Args:
-        amps: Charging amperage
-
-    Returns:
-        bool: True if successful
-    """
-    try:
-        amps = max(MIN_CHARGE_AMPS, min(MAX_CHARGE_AMPS, int(amps)))
-        log.info(f"Starting solar opportunistic charging at {amps}A")
-
-        state.setattr(OUTPUT_CHARGING_STATUS + ".charging_started_by", "solar_opportunistic")
-        state.setattr(OUTPUT_CHARGING_STATUS + ".charging_started_at", datetime.now().isoformat())
-        state.setattr(OUTPUT_CHARGING_STATUS + ".charging_amps", amps)
-
-        number.set_value(entity_id=TESLA_CHARGE_CURRENT, value=amps)
-        task.sleep(2)
-        switch.turn_on(entity_id=TESLA_CHARGE_SWITCH)
-
-        _set_last_solar_change_time()
-
-        return True
-    except Exception as e:
-        log.warning(f"Error starting solar opportunistic charging: {e}")
-        return False
-
-
-def _stop_solar_opportunistic_charging():
-    """Stop solar opportunistic charging.
-
-    Only stops if we started it for solar opportunism.
-
-    Returns:
-        bool: True if stopped, False otherwise
-    """
-    try:
-        if not _is_in_opportunistic_solar_mode():
-            log.debug("Not in solar opportunistic mode, not stopping")
-            return False
-
-        log.info("Stopping solar opportunistic charging")
-        switch.turn_off(entity_id=TESLA_CHARGE_SWITCH)
-
-        state.setattr(OUTPUT_CHARGING_STATUS + ".charging_stopped_at", datetime.now().isoformat())
-        state.setattr(OUTPUT_CHARGING_STATUS + ".charging_started_by", "none")
-        _set_last_solar_change_time()
-
-        return True
-    except Exception as e:
-        log.warning(f"Error stopping solar opportunistic charging: {e}")
-        return False
-
-
 def _calculate_target_amps_from_power(excess_watts):
     """Calculate target charging amps from excess power.
 
@@ -1804,6 +1670,149 @@ def _calculate_target_amps_from_power(excess_watts):
     power_per_amp = VOLTAGE * PHASES  # 230V x 3 = 690W per amp
     target_amps = int(excess_watts / power_per_amp)
     return max(MIN_CHARGE_AMPS, min(MAX_CHARGE_AMPS, target_amps))
+
+
+def _compute_desired_action(
+    is_in_slot,
+    is_charging,
+    is_daylight,
+    surplus_watts,
+    buy_price,
+    sell_price,
+):
+    """Determine desired charging action from current conditions.
+
+    Returns a dict describing the action:
+        {'type': 'charge', 'amps': int, 'status_code': int, 'status_msg': str}
+        {'type': 'stop', 'status_code': int, 'status_msg': str}
+        {'type': 'noop', 'status_code': int, 'status_msg': str}
+
+    Decision precedence:
+      1. In scheduled slot -> charge at MAX_CHARGE_AMPS
+      2. Outside daylight -> stop or wait
+      3. Pure solar sustain (already charging, surplus >= MIN_CHARGE_POWER_W)
+      4. Pure solar start (not charging, surplus >= SOLAR_START_THRESHOLD_W)
+      5. Blended (surplus >= SOLAR_BLENDED_MIN_W and price cheap) -> MIN_CHARGE_AMPS
+      6. Else -> stop or noop
+    """
+    # Scheduled slot: max amps, preempts solar
+    if is_in_slot:
+        return {
+            'type': 'charge',
+            'amps': MAX_CHARGE_AMPS,
+            'status_code': 2,
+            'status_msg': 'Scheduled charging',
+        }
+
+    # Outside scheduled slot, outside daylight: stop or wait
+    if not is_daylight:
+        if is_charging:
+            return {'type': 'stop', 'status_code': 1, 'status_msg': 'Waiting for scheduled slot'}
+        return {'type': 'noop', 'status_code': 1, 'status_msg': 'Waiting for scheduled slot'}
+
+    # Pure solar sustain: keep charging as long as surplus covers 5A minimum
+    if is_charging and surplus_watts >= MIN_CHARGE_POWER_W:
+        target_amps = _calculate_target_amps_from_power(surplus_watts)
+        return {
+            'type': 'charge',
+            'amps': target_amps,
+            'status_code': 3,
+            'status_msg': f'Pure solar: {surplus_watts:.0f}W @ {target_amps}A',
+        }
+
+    # Pure solar start: require start threshold (debounce margin above sustain)
+    if not is_charging and surplus_watts >= SOLAR_START_THRESHOLD_W:
+        target_amps = _calculate_target_amps_from_power(surplus_watts)
+        return {
+            'type': 'charge',
+            'amps': target_amps,
+            'status_code': 3,
+            'status_msg': f'Pure solar start: {surplus_watts:.0f}W @ {target_amps}A',
+        }
+
+    # Blended: partial solar + grid, only if price is attractive
+    if surplus_watts >= SOLAR_BLENDED_MIN_W and buy_price is not None:
+        effective_price = _calculate_blended_effective_price(
+            surplus_watts, buy_price, sell_price or 0
+        )
+        if _is_price_cheap(effective_price):
+            return {
+                'type': 'charge',
+                'amps': MIN_CHARGE_AMPS,
+                'status_code': 3,
+                'status_msg': f'Blended: {surplus_watts:.0f}W + grid @ {MIN_CHARGE_AMPS}A',
+            }
+
+    # Insufficient / not cheap
+    if is_charging:
+        return {
+            'type': 'stop',
+            'status_code': 0,
+            'status_msg': f'Insufficient surplus ({surplus_watts:.0f}W)',
+        }
+    return {'type': 'noop', 'status_code': 0, 'status_msg': 'No charging conditions met'}
+
+
+def _get_effective_surplus(is_charging):
+    """Compute surplus for charging decisions.
+
+    When charging: instantaneous grid_power + tesla_power (real-time, no averaging lag).
+    When not charging: 15-min averaged grid power (debounces transients).
+
+    Grid power convention: positive = exporting (surplus), negative = importing.
+
+    Returns:
+        float: Effective surplus in watts (0.0 on sensor error).
+    """
+    try:
+        if is_charging:
+            grid_power = float(state.get(GRID_POWER_CURRENT) or 0)
+            tesla_power_w = float(state.get(TESLA_CHARGER_POWER) or 0) * 1000
+            return grid_power + tesla_power_w
+        return float(state.get(GRID_POWER_15MIN_AVG) or 0)
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def _update_solar_availability_indicator(is_charging):
+    """Update input_select.tesla_solar_charging_available.
+
+    Indicator answers: "would solar charging start if I plugged in now?"
+    When already charging, adds back Tesla draw so the value reflects true
+    available surplus (not post-Tesla consumption).
+
+    Called independently of car gates so the dashboard shows solar availability
+    regardless of car location / cable state. Off outside daylight.
+    """
+    if not _is_during_daylight():
+        input_select.select_option(entity_id=OUTPUT_SOLAR_AVAILABLE, option='off')
+        return
+
+    try:
+        if is_charging:
+            tesla_power_w = float(state.get(TESLA_CHARGER_POWER) or 0) * 1000
+            available = float(state.get(GRID_POWER_15MIN_AVG) or 0) + tesla_power_w
+        else:
+            available = float(state.get(GRID_POWER_15MIN_AVG) or 0)
+    except (ValueError, TypeError):
+        input_select.select_option(entity_id=OUTPUT_SOLAR_AVAILABLE, option='off')
+        return
+
+    if available >= SOLAR_START_THRESHOLD_W:
+        input_select.select_option(entity_id=OUTPUT_SOLAR_AVAILABLE, option='pure')
+        return
+
+    if available >= SOLAR_BLENDED_MIN_W:
+        buy_price, sell_price = _get_current_prices()
+        if buy_price is not None:
+            eff = _calculate_blended_effective_price(available, buy_price, sell_price or 0)
+            if _is_price_cheap(eff):
+                input_select.select_option(entity_id=OUTPUT_SOLAR_AVAILABLE, option='blended')
+                return
+        input_select.select_option(entity_id=OUTPUT_SOLAR_AVAILABLE, option='off')
+        return
+
+    input_select.select_option(entity_id=OUTPUT_SOLAR_AVAILABLE, option='off')
 
 
 def _update_charging_schedule(message):
@@ -1838,7 +1847,7 @@ def calculateTeslaChargingSchedule():
     Preconditions:
     - Smart charging must be enabled
 
-    The schedule is stored to HA entities and executed by executeTeslaChargingSchedule().
+    The schedule is stored to HA entities and executed by tesla_charging_control().
     """
     log.info("Daily Tesla charging schedule calculation triggered")
 
@@ -1860,101 +1869,89 @@ def calculateTeslaChargingSchedule():
         log.warning(f"Schedule calculation failed: {result['message']}")
 
 
-@time_trigger("cron(2,17,32,47 * * * *)")
-def executeTeslaChargingSchedule():
-    """Execute the Tesla charging schedule every 15 minutes.
+@time_trigger("cron(*/15 * * * *)")
+@service
+def tesla_charging_control():
+    """Unified charging controller — runs every 15 minutes.
 
-    Runs at minutes 2, 17, 32, 47 of each hour (offset from slot boundaries).
-    Reads the stored schedule and starts/stops charging based on whether
-    the current time falls within a scheduled slot.
+    Single control loop:
+      1. Gate: smart charging enabled
+      2. Update solar availability indicator (before car gates)
+      3. Gate: car at home + cable connected
+      4. Gate: at charge limit -> stop + status 5
+      5. Compute desired action via _compute_desired_action
+      6. Execute (start/stop/adjust amps as needed)
 
-    Important behaviors:
-    - Does NOT check SOC to avoid waking the car unnecessarily
-    - Only stops charging if it was started by smart charging (not manual)
-    - Tracks charging state to handle transitions properly
+    State-based: every tick re-derives desired action from current conditions.
+    No history / ownership flags. Manual override = toggle smart charging off.
     """
-    log.debug("Executing Tesla charging schedule check")
-
-    # Check if smart charging is enabled
     if not _is_smart_charging_enabled():
-        log.debug("Smart charging is disabled")
+        input_select.select_option(entity_id=OUTPUT_SOLAR_AVAILABLE, option='off')
         return
 
-    # Check if car is at home (uses cached state, doesn't wake car)
-    if not _is_car_at_home():
-        log.debug("Car is not at home")
-        return
-
-    # Check if cable is connected (uses cached state, doesn't wake car)
-    if not _is_cable_connected():
-        log.debug("Charging cable not connected")
-        return
-
-    # Get the stored schedule
-    schedule = _get_stored_schedule()
-
-    if not schedule:
-        log.debug("No charging schedule stored")
-        return
-
-    # Check schedule mode - if complete, nothing to do
-    mode = schedule.get('mode', '')
-    if mode == 'complete' or mode == 'idle':
-        log.debug(f"Schedule mode is '{mode}', no action needed")
-        return
-
-    # Check if current time is within a scheduled slot
-    is_in_slot, current_slot = _is_current_time_in_scheduled_slot(schedule)
     is_charging = _is_currently_charging()
+    _update_solar_availability_indicator(is_charging)
 
-    log.debug(f"Slot check: in_slot={is_in_slot}, charging={is_charging}")
+    if not _is_car_at_home() or not _is_cable_connected():
+        return
 
-    if is_in_slot:
-        # We SHOULD be charging
-        if not is_charging:
-            log.info(f"Starting scheduled charging for slot: {current_slot['start']}")
-            if _start_charging(MAX_CHARGE_AMPS):
-                solar_energy = current_slot.get('solar_energy', 0)
-                if solar_energy > 0.5:
-                    _update_charging_status(3, "Charging (solar)")
-                else:
-                    _update_charging_status(2, "Charging (grid)")
-            else:
-                log.warning("Failed to start charging")
-                _update_charging_status(-1, "Failed to start charging")
-        else:
-            # Already charging - verify amps are at MAX for scheduled slot
-            current_amps = int(float(state.get(TESLA_CHARGE_CURRENT) or 0))
-            if current_amps < MAX_CHARGE_AMPS:
-                log.warning(f"Scheduled slot: adjusting amps {current_amps}A -> {MAX_CHARGE_AMPS}A")
-                _adjust_charging_amps(MAX_CHARGE_AMPS)
-            solar_energy = current_slot.get('solar_energy', 0)
-            if solar_energy > 0.5:
-                _update_charging_status(3, "Charging (solar)")
-            else:
-                _update_charging_status(2, "Charging (grid)")
-    else:
-        # Outside scheduled slots
+    current_soc = _get_current_soc()
+    charge_limit = _get_charge_limit()
+    if current_soc is not None and charge_limit is not None and current_soc >= charge_limit:
         if is_charging:
-            # Don't stop solar opportunistic charging — it's managed by handle_solar_opportunity
-            if _is_in_opportunistic_solar_mode():
-                log.debug("Outside scheduled slot but in solar mode, not stopping")
-            else:
-                log.info("Stopping charging - outside scheduled slot")
-                if _stop_charging():
-                    _update_charging_status(4, "Paused - waiting for next slot")
-                    # Immediately evaluate solar conditions for seamless transition
-                    handle_solar_opportunity()
-                else:
-                    log.warning("Failed to stop charging")
-        elif not _is_in_opportunistic_solar_mode() and schedule.get('slots'):
-            _update_charging_status(1, "Waiting for scheduled slot")
-        elif not _is_in_opportunistic_solar_mode():
-            _update_charging_status(0, "No charging scheduled")
+            _stop_charging()
+        _update_charging_status(5, 'Target SOC reached')
+        return
+
+    schedule = _get_stored_schedule()
+    is_in_slot = False
+    current_slot = None
+    if schedule:
+        is_in_slot, current_slot = _is_current_time_in_scheduled_slot(schedule)
+
+    try:
+        current_amps = int(float(state.get(TESLA_CHARGE_CURRENT) or 0))
+    except (ValueError, TypeError):
+        current_amps = 0
+    is_daylight = _is_during_daylight()
+    surplus_watts = _get_effective_surplus(is_charging)
+    buy_price, sell_price = (None, None)
+    if is_daylight:
+        buy_price, sell_price = _get_current_prices()
+
+    action = _compute_desired_action(
+        is_in_slot=is_in_slot,
+        is_charging=is_charging,
+        is_daylight=is_daylight,
+        surplus_watts=surplus_watts,
+        buy_price=buy_price,
+        sell_price=sell_price,
+    )
+
+    if action['type'] == 'charge':
+        status_code = action['status_code']
+        # Refine scheduled-slot status based on solar content of current slot
+        if is_in_slot and current_slot:
+            solar_energy = current_slot.get('solar_energy', 0)
+            status_code = 3 if solar_energy > 0.5 else 2
+
+        if not is_charging:
+            _start_charging(action['amps'])
+        elif abs(current_amps - action['amps']) >= 1:
+            _adjust_charging_amps(action['amps'])
+        _update_charging_status(status_code, action['status_msg'])
+
+    elif action['type'] == 'stop':
+        if is_charging:
+            _stop_charging()
+        _update_charging_status(action['status_code'], action['status_msg'])
+
+    else:  # noop
+        _update_charging_status(action['status_code'], action['status_msg'])
 
 
 # =============================================================================
-# STATE TRIGGERS - Replanning and Solar Opportunism
+# STATE TRIGGERS - Replanning on schedule-affecting events
 # =============================================================================
 
 @state_trigger(f"{OUTPUT_SMART_CHARGING_ENABLED} == 'on'")
@@ -1976,11 +1973,8 @@ def on_smart_charging_enabled():
     else:
         log.warning(f"Schedule calculation on enable failed: {result['message']}")
 
-    # Stop charging if currently charging outside a scheduled slot
-    if _is_currently_charging() and not _is_in_scheduled_slot():
-        log.info("Stopping charging - not in scheduled slot after re-enable")
-        _stop_charging()
-        _update_charging_status(4, "Stopped - waiting for slot")
+    # Immediately evaluate current conditions via unified controller
+    tesla_charging_control()
 
 
 @state_trigger(f"{TESLA_LOCATION} == '{HOME_LOCATION}'")
@@ -2001,6 +1995,9 @@ def on_car_arrives_home():
         log.info(f"Schedule calculated on arrival: {result['message']}")
     else:
         log.warning(f"Schedule calculation on arrival failed: {result['message']}")
+
+    # Immediately evaluate current conditions via unified controller
+    tesla_charging_control()
 
 
 @state_trigger(f"{TESLA_CHARGE_CABLE} == 'on'")
@@ -2036,236 +2033,13 @@ def on_cable_connected():
     except Exception as e:
         log.error(f"Exception during schedule calculation: {e}")
 
-
-@state_trigger(f"{TESLA_CHARGING_STATE} == 'charging'")
-def on_charging_started():
-    """Trigger when Tesla starts charging.
-
-    When Tesla auto-starts charging on cable connect, the integration
-    reports the state change with fresh data. This is the ideal point
-    to check whether we should allow or stop the charge.
-    """
-    log.info("Tesla charging started - checking if in scheduled slot")
-
-    if not _is_smart_charging_enabled():
-        log.debug("Smart charging disabled, not interfering with charging")
-        return
-
-    if not _is_car_at_home():
-        log.debug("Car not at home, not interfering with charging")
-        return
-
-    if _is_in_scheduled_slot():
-        log.info("Charging in scheduled slot - allowing")
-        state.setattr(OUTPUT_CHARGING_STATUS + ".charging_started_by", "smart_charging")
-    elif _is_in_opportunistic_solar_mode():
-        log.info("Charging started by solar opportunism - allowing")
-    else:
-        log.info("Stopping auto-started charging - not in scheduled slot")
-        if not _stop_charging():
-            log.error("Stop charging command failed")
-        _update_charging_status(4, "Auto-charge stopped - waiting for slot")
-
-
-@time_trigger("cron(*/15 * * * *)")
-def handle_solar_opportunity():
-    """Handle solar opportunistic charging based on grid power.
-
-    Runs every 15 minutes and reads a 15-minute average grid power sensor
-    to smooth out fluctuations. Three-tier decision logic:
-    - Tier 1 PURE: surplus >= SOLAR_START_THRESHOLD_W (4500W) - charge at calculated amps
-    - Tier 2 BLENDED: surplus >= SOLAR_BLENDED_MIN_W (1500W) - charge at min amps if price cheap
-    - Tier 3 STOP: surplus < SOLAR_BLENDED_MIN_W - stop opportunistic charging
-
-    Grid power convention for sensor: positive = exporting, negative = importing.
-    """
-    # Skip if smart charging is disabled
-    if not _is_smart_charging_enabled():
-        input_select.select_option(entity_id=OUTPUT_SOLAR_AVAILABLE, option="off")
-        log.debug("SOLAR EXIT: smart charging disabled")
-        return
-
-    # Skip if not during daylight hours
-    if not _is_during_daylight():
-        input_select.select_option(entity_id=OUTPUT_SOLAR_AVAILABLE, option="off")
-        log.debug("SOLAR EXIT: not during daylight")
-        return
-
-    # Read surplus early so we can update the availability indicator
-    # before car-specific gates.
-    is_charging = _is_currently_charging()
-    is_solar_mode = _is_in_opportunistic_solar_mode()
-
-    # Calculate effective surplus for charging decisions.
-    # Start decision: 15-min average grid power — stable, filters transient spikes.
-    # Ongoing decision: instantaneous grid_power + tesla_power — real-time accuracy,
-    #   no averaging lag regardless of how long Tesla has been charging.
-    try:
-        if is_charging and is_solar_mode:
-            grid_power = float(state.get(GRID_POWER_CURRENT) or 0)
-            tesla_power_w = float(state.get(TESLA_CHARGER_POWER) or 0) * 1000
-            surplus_watts = grid_power + tesla_power_w
-        else:
-            surplus_watts = float(state.get(GRID_POWER_15MIN_AVG) or 0)
-    except (ValueError, TypeError):
-        input_select.select_option(entity_id=OUTPUT_SOLAR_AVAILABLE, option="off")
-        log.warning("SOLAR EXIT: error reading surplus")
-        return
-
-    log.debug(f"SOLAR: surplus={surplus_watts:.0f}W, charging={is_charging}, solar_mode={is_solar_mode}")
-
-    # Calculate "unplugged" surplus for the availability indicator:
-    # "would solar charging start if I plugged in now?"
-    # If car is charging (any mode), add back Tesla draw to get true available surplus.
-    try:
-        if is_charging:
-            tesla_power_w = float(state.get(TESLA_CHARGER_POWER) or 0) * 1000
-            available_surplus = float(state.get(GRID_POWER_15MIN_AVG) or 0) + tesla_power_w
-        else:
-            available_surplus = surplus_watts
-    except (ValueError, TypeError):
-        available_surplus = surplus_watts
-
-    # Update solar availability indicator: off / blended / pure
-    if available_surplus >= SOLAR_START_THRESHOLD_W:
-        input_select.select_option(entity_id=OUTPUT_SOLAR_AVAILABLE, option="pure")
-    elif available_surplus >= SOLAR_BLENDED_MIN_W:
-        buy_price, sell_price = _get_current_prices()
-        if buy_price is not None:
-            eff_price = _calculate_blended_effective_price(available_surplus, buy_price, sell_price or 0)
-            is_cheap = _is_price_cheap(eff_price)
-            log.info(f"SOLAR HELPER: blended check - surplus={available_surplus:.0f}W, eff_price={eff_price:.2f} c/kWh, cheap={is_cheap}")
-            if is_cheap:
-                input_select.select_option(entity_id=OUTPUT_SOLAR_AVAILABLE, option="blended")
-            else:
-                input_select.select_option(entity_id=OUTPUT_SOLAR_AVAILABLE, option="off")
-        else:
-            input_select.select_option(entity_id=OUTPUT_SOLAR_AVAILABLE, option="off")
-            log.warning("SOLAR HELPER: no buy price available")
-    else:
-        input_select.select_option(entity_id=OUTPUT_SOLAR_AVAILABLE, option="off")
-
-    # Skip if car not at home or cable not connected
-    if not _is_car_at_home() or not _is_cable_connected():
-        log.debug(f"SOLAR EXIT: car_home={_is_car_at_home()}, cable={_is_cable_connected()}")
-        return
-
-    # =======================================================================
-    # SLOWER CHECKS - after debounce
-    # =======================================================================
-
-    # Skip if in a scheduled charging slot (scheduled charging takes priority)
-    if _is_in_scheduled_slot():
-        log.debug("SOLAR EXIT: in scheduled slot")
-        return
-
-    # Throttle actual charging changes to prevent rapid cycling
-    # (this is the 5-minute interval between start/stop commands)
-    if not _is_solar_change_allowed():
-        log.debug("SOLAR EXIT: change not allowed (cooldown)")
-        return
-
-    # Check current SOC - don't solar charge if already at limit
-    current_soc = _get_current_soc()
-    charge_limit = _get_charge_limit()
-    if current_soc is not None and charge_limit is not None:
-        if current_soc >= charge_limit:
-            # Already at limit - stop if in solar mode
-            if is_charging and is_solar_mode:
-                log.info("SOC at limit, stopping solar opportunistic charging")
-                _stop_solar_opportunistic_charging()
-                _update_charging_status(5, "Target SOC reached")
-            return
-
-    # =======================================================================
-    # THREE-TIER DECISION LOGIC
-    # Tier 1: PURE SOLAR (surplus >= 4500W) - charge at calculated amps
-    # Tier 2: BLENDED (1500W <= surplus < 4500W) - charge at min if price cheap
-    # Tier 3: STOP (surplus < 1500W AND in solar mode) - stop charging
-    # =======================================================================
-
-    # --- TIER 1: PURE SOLAR ---
-    # Enough excess solar to fully cover minimum charge power
-    if surplus_watts >= SOLAR_START_THRESHOLD_W:
-        target_amps = _calculate_target_amps_from_power(surplus_watts)
-
-        if not is_charging:
-            # Not charging - start pure solar opportunistic charging
-            log.info(f"PURE SOLAR: Starting charging at {target_amps}A ({surplus_watts:.0f}W surplus)")
-            if _start_solar_opportunistic_charging(target_amps):
-                _update_charging_status(3, f"Solar charging: {surplus_watts:.0f}W surplus")
-        elif is_solar_mode:
-            # Already in solar mode - adjust amps if beneficial
-            current_amps = int(float(state.get(TESLA_CHARGE_CURRENT) or 0))
-            if abs(target_amps - current_amps) >= 1:
-                log.info(f"PURE SOLAR: Adjusting {current_amps}A -> {target_amps}A ({surplus_watts:.0f}W surplus)")
-                _adjust_charging_amps(target_amps)
-                _set_last_solar_change_time()
-
-    # --- TIER 2: BLENDED (partial solar + grid) ---
-    # Some solar available but not enough for full minimum charge power
-    # Only charge if grid price makes the blended price attractive
-    elif surplus_watts >= SOLAR_BLENDED_MIN_W:
-        # Get current prices for blended calculation
-        buy_price, sell_price = _get_current_prices()
-
-        if buy_price is not None:
-            # Calculate effective blended price
-            effective_price = _calculate_blended_effective_price(surplus_watts, buy_price, sell_price)
-            is_cheap = _is_price_cheap(effective_price)
-
-            log.debug(f"BLENDED: surplus={surplus_watts:.0f}W, buy={buy_price:.4f}, "
-                      f"eff={effective_price:.4f}, cheap={is_cheap}")
-
-            if is_cheap:
-                # Blended price is attractive - charge at minimum amps
-                if not is_charging:
-                    log.info(f"BLENDED: Starting charging at {MIN_CHARGE_AMPS}A "
-                             f"({surplus_watts:.0f}W surplus, eff_price={effective_price:.4f})")
-                    if _start_solar_opportunistic_charging(MIN_CHARGE_AMPS):
-                        _update_charging_status(3, f"Blended charging: {surplus_watts:.0f}W + grid")
-                elif is_solar_mode:
-                    # Already in solar mode from pure solar - reduce to minimum amps
-                    current_amps = int(float(state.get(TESLA_CHARGE_CURRENT) or 0))
-                    if current_amps > MIN_CHARGE_AMPS:
-                        log.info(f"BLENDED: Reducing {current_amps}A -> {MIN_CHARGE_AMPS}A (entering blended zone)")
-                        _adjust_charging_amps(MIN_CHARGE_AMPS)
-                        _set_last_solar_change_time()
-            else:
-                # Blended price not attractive - stop if we're in solar mode
-                if is_charging and is_solar_mode:
-                    log.info(f"BLENDED: Stopping - price not cheap enough "
-                             f"(eff={effective_price:.4f}, surplus={surplus_watts:.0f}W)")
-                    if _stop_solar_opportunistic_charging():
-                        _update_charging_status(0, "Solar paused - blended price too high")
-        else:
-            # No price data available - be conservative, stop if in solar mode
-            if is_charging and is_solar_mode:
-                log.info("BLENDED: Stopping - no price data available")
-                if _stop_solar_opportunistic_charging():
-                    _update_charging_status(0, "Solar paused - no price data")
-
-    # --- TIER 3: STOP ---
-    # Below SOLAR_BLENDED_MIN_W - insufficient surplus for any solar charging
-    elif is_charging and is_solar_mode:
-        log.info(f"STOP: Stopping solar charging ({surplus_watts:.0f}W surplus below {SOLAR_BLENDED_MIN_W}W threshold)")
-        if _stop_solar_opportunistic_charging():
-            _update_charging_status(0, "Solar charging paused - insufficient surplus")
+    # Immediately evaluate current conditions via unified controller
+    tesla_charging_control()
 
 
 # =============================================================================
 # TEST SERVICE
 # =============================================================================
-
-@service
-def teslaSolarOpportunityCheck():
-    """Manually trigger a solar opportunistic charging check.
-
-    Call from HA Developer Tools > Services > pyscript.tesla_solar_opportunity_check
-    """
-    log.info("Manually triggering solar opportunity check")
-    handle_solar_opportunity()
-
 
 @service
 def teslaSmartChargingTestService(action=None, id=None):
@@ -2307,7 +2081,7 @@ def teslaSmartChargingTestService(action=None, id=None):
             log.info(f"Normalized {len(raw_today)} raw entries to {len(normalized)} 15-min intervals")
             if normalized:
                 prices = [d['value'] for d in normalized if 'value' in d]
-                log.info(f"Price range today: {min(prices):.4f} - {max(prices):.4f} EUR/kWh")
+                log.info(f"Price range today: {min(prices):.4f} - {max(prices):.4f} c/kWh")
     except Exception as e:
         log.warning(f"Error testing price normalization: {e}")
 
@@ -2322,7 +2096,7 @@ def teslaSmartChargingTestService(action=None, id=None):
         buy_price = float(state.get(NORDPOOL_SENSOR) or 0.10)
         sell_price = float(state.get(SELL_PRICE_SENSOR) or 0.05)
         eff_price, solar_e, grid_e = _calculate_effective_price(now, buy_price, sell_price)
-        log.info(f"Effective price: {eff_price:.4f} EUR/kWh (solar: {solar_e:.2f} kWh, grid: {grid_e:.2f} kWh)")
+        log.info(f"Effective price: {eff_price:.4f} c/kWh (solar: {solar_e:.2f} kWh, grid: {grid_e:.2f} kWh)")
 
         # Test slot list building
         slots = _build_slot_list_with_effective_prices()
@@ -2350,13 +2124,13 @@ def teslaSmartChargingTestService(action=None, id=None):
                 log.info("Mandatory slots (before deadline):")
                 for i, slot in enumerate(mandatory[:5]):  # Show first 5
                     log.info(f"  {i+1}. {slot['start'].strftime('%Y-%m-%d %H:%M')} - "
-                             f"eff: {slot['effective_price']:.4f} EUR/kWh")
+                             f"eff: {slot['effective_price']:.4f} c/kWh")
 
             if optional:
                 log.info("Optional slots (any time):")
                 for i, slot in enumerate(optional[:5]):  # Show first 5
                     log.info(f"  {i+1}. {slot['start'].strftime('%Y-%m-%d %H:%M')} - "
-                             f"eff: {slot['effective_price']:.4f} EUR/kWh")
+                             f"eff: {slot['effective_price']:.4f} c/kWh")
     except Exception as e:
         log.warning(f"Error testing scheduling algorithm: {e}")
         # Fall back to simple status update
@@ -2378,7 +2152,7 @@ def teslaSmartChargingTestService(action=None, id=None):
             for surplus in test_surpluses:
                 eff = _calculate_blended_effective_price(surplus, buy_price, sell_price)
                 solar_frac = min(surplus / MIN_CHARGE_POWER_W, 1.0) * 100
-                log.info(f"  {surplus}W surplus: {eff:.4f} EUR/kWh ({solar_frac:.0f}% solar)")
+                log.info(f"  {surplus}W surplus: {eff:.4f} c/kWh ({solar_frac:.0f}% solar)")
 
             # Test with known prices
             log.info(f"_is_price_cheap() tests:")
@@ -2388,5 +2162,31 @@ def teslaSmartChargingTestService(action=None, id=None):
             log.info(f"  Price 0.20: cheap = {_is_price_cheap(0.20)}")
     except Exception as e:
         log.warning(f"Error testing blended pricing functions: {e}")
+
+    # Test unified controller decision logic
+    try:
+        log.info("Testing unified controller decision logic...")
+
+        # Gather live state for a sample decision
+        schedule_now = _get_stored_schedule()
+        is_in_slot_now = False
+        if schedule_now:
+            is_in_slot_now, _ = _is_current_time_in_scheduled_slot(schedule_now)
+        is_charging_now = _is_currently_charging()
+        is_daylight_now = _is_during_daylight()
+        surplus_now = _get_effective_surplus(is_charging_now)
+        buy_now, sell_now = _get_current_prices() if is_daylight_now else (None, None)
+
+        action = _compute_desired_action(
+            is_in_slot=is_in_slot_now,
+            is_charging=is_charging_now,
+            is_daylight=is_daylight_now,
+            surplus_watts=surplus_now,
+            buy_price=buy_now,
+            sell_price=sell_now,
+        )
+        log.info(f"Current decision: {action}")
+    except Exception as e:
+        log.warning(f"Error exercising unified controller decision: {e}")
 
     log.warning("Tesla Smart Charging test service completed")
