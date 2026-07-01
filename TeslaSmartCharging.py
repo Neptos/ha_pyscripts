@@ -792,8 +792,10 @@ def _build_slot_list_with_effective_prices():
             else:
                 end = start + SLOT_DURATION
 
-            # Skip past-ended slots AND the current partial slot (only count full 15-min slots)
-            if start < now:
+            # Skip only fully-elapsed slots. The current partial slot is kept
+            # (treated as a full slot) so per-tick recalculation in
+            # tesla_charging_control can still select the slot we're charging in.
+            if end <= now:
                 continue
 
             buy_price = float(price_entry['value'])
@@ -827,11 +829,11 @@ def _build_slot_list_with_effective_prices():
         # Sort by effective price (cheapest first)
         slots.sort(key=lambda s: s['effective_price'])
 
-        log.info(f"Built {len(slots)} charging slots with effective prices")
+        log.debug(f"Built {len(slots)} charging slots with effective prices")
         if slots:
             cheapest = slots[0]
             most_expensive = slots[-1]
-            log.info(f"Price range: {cheapest['effective_price']:.2f} - {most_expensive['effective_price']:.2f} c/kWh")
+            log.debug(f"Price range: {cheapest['effective_price']:.2f} - {most_expensive['effective_price']:.2f} c/kWh")
 
         return slots
 
@@ -1055,7 +1057,7 @@ def _apply_price_ceiling(mandatory_slots, optional_slots, max_avg_price):
         if avg <= max_avg_price:
             break
         dropped = optional.pop(0)  # Drop most expensive
-        log.info(f"Price ceiling: dropped slot at {dropped['start'].strftime('%H:%M')} "
+        log.debug(f"Price ceiling: dropped slot at {dropped['start'].strftime('%H:%M')} "
                  f"({dropped['effective_price']:.2f} c/kWh)")
 
     return optional
@@ -1212,7 +1214,7 @@ def _store_schedule(schedule_slots, mode, current_soc=None):
                 state.setattr(OUTPUT_CHARGING_STATUS + ".next_slot_start", slots_json[0]['start'])
                 state.setattr(OUTPUT_CHARGING_STATUS + ".schedule_end", slots_json[-1]['end'])
 
-            log.info(f"Stored schedule: {len(slots_json)} slots, {solar_slots_count} solar, "
+            log.debug(f"Stored schedule: {len(slots_json)} slots, {solar_slots_count} solar, "
                      f"estimated cost: {total_cost:.4f} EUR, mode: {mode}")
         except Exception as e:
             log.warning(f"Error storing schedule attributes: {e}")
@@ -1254,12 +1256,12 @@ def _calculate_and_store_schedule():
             _update_charging_status(-1, "Charge limit unavailable")
             return {'success': False, 'message': "Charge limit unavailable"}
 
-        log.info(f"Calculating schedule: SOC={current_soc}%, limit={charge_limit}%, "
+        log.debug(f"Calculating schedule: SOC={current_soc}%, limit={charge_limit}%, "
                  f"min_guarantee={MIN_SOC_GUARANTEE}%")
 
         # Check if already at or above charge limit
         if current_soc >= charge_limit:
-            log.info("Already at or above charge limit, no charging needed")
+            log.debug("Already at or above charge limit, no charging needed")
             _store_schedule([], mode="complete", current_soc=current_soc)
             _update_charging_status(5, "Target SOC reached")
             return {
@@ -1272,7 +1274,7 @@ def _calculate_and_store_schedule():
         # Get next deadline
         deadline = _get_next_deadline()
 
-        log.info(f"Next deadline: {deadline.strftime('%Y-%m-%d %H:%M')}")
+        log.debug(f"Next deadline: {deadline.strftime('%Y-%m-%d %H:%M')}")
 
         # Build slot list with effective prices
         all_slots = _build_slot_list_with_effective_prices()
@@ -1304,9 +1306,9 @@ def _calculate_and_store_schedule():
                 slot_energy = MAX_CHARGE_RATE_KW * SLOT_DURATION_HOURS  # kWh per 15-min slot
                 cold_weather_extra = extra_slots * slot_energy
                 mandatory_energy_needed += cold_weather_extra
-                log.info(f"Cold weather: {temp}°C -> +{extra_slots} slots ({cold_weather_extra:.2f} kWh)")
+                log.debug(f"Cold weather: {temp}°C -> +{extra_slots} slots ({cold_weather_extra:.2f} kWh)")
 
-            log.info(f"Pass 1: Need {mandatory_energy_needed:.2f} kWh for mandatory charging "
+            log.debug(f"Pass 1: Need {mandatory_energy_needed:.2f} kWh for mandatory charging "
                      f"({current_soc}% -> {MIN_SOC_GUARANTEE}%)")
 
             # Filter slots that are BEFORE the deadline
@@ -1330,7 +1332,7 @@ def _calculate_and_store_schedule():
             )
 
             mandatory_energy_selected = sum([s['energy'] for s in mandatory_slots])
-            log.info(f"Pass 1: Selected {len(mandatory_slots)} mandatory slots "
+            log.debug(f"Pass 1: Selected {len(mandatory_slots)} mandatory slots "
                      f"({mandatory_energy_selected:.2f} kWh)")
 
             # Check if we have enough slots
@@ -1340,7 +1342,7 @@ def _calculate_and_store_schedule():
                             f"only {mandatory_energy_selected:.2f} kWh available")
                 # Continue anyway - charge as much as possible
         else:
-            log.info(f"Pass 1: Skipped - SOC {current_soc}% >= minimum {MIN_SOC_GUARANTEE}%")
+            log.debug(f"Pass 1: Skipped - SOC {current_soc}% >= minimum {MIN_SOC_GUARANTEE}%")
 
         # =====================================================================
         # PASS 2: Optional Charging (no price ceiling yet)
@@ -1360,7 +1362,7 @@ def _calculate_and_store_schedule():
         optional_energy_needed = _calculate_kwh_needed(soc_after_mandatory, charge_limit)
 
         if optional_energy_needed > 0:
-            log.info(f"Pass 2: Need {optional_energy_needed:.2f} kWh for optional charging "
+            log.debug(f"Pass 2: Need {optional_energy_needed:.2f} kWh for optional charging "
                      f"({soc_after_mandatory:.1f}% -> {charge_limit}%)")
 
             # Filter out slots already selected in mandatory pass
@@ -1376,10 +1378,10 @@ def _calculate_and_store_schedule():
             )
 
             optional_energy_selected = sum([s['energy'] for s in optional_slots])
-            log.info(f"Pass 2: Selected {len(optional_slots)} optional slots "
+            log.debug(f"Pass 2: Selected {len(optional_slots)} optional slots "
                      f"({optional_energy_selected:.2f} kWh)")
         else:
-            log.info("Pass 2: Skipped - no optional charging needed")
+            log.debug("Pass 2: Skipped - no optional charging needed")
 
         # =====================================================================
         # CONSOLIDATION: Reduce fragmentation by relocating isolated slots
@@ -1394,7 +1396,7 @@ def _calculate_and_store_schedule():
             # Re-split: mandatory slots are those whose start is in original mandatory_starts
             mandatory_slots = [s for s in all_selected_slots if s['start'] in mandatory_starts]
             optional_slots = [s for s in all_selected_slots if s['start'] not in mandatory_starts]
-            log.info(f"Consolidation: {pre_consolidation_count} slots -> "
+            log.debug(f"Consolidation: {pre_consolidation_count} slots -> "
                      f"{len(mandatory_slots)} mandatory + {len(optional_slots)} optional")
 
         # =====================================================================
@@ -1410,7 +1412,7 @@ def _calculate_and_store_schedule():
             pre_ceiling_count = len(optional_slots)
             optional_slots = _apply_price_ceiling(mandatory_slots, optional_slots, max_avg_price)
             if len(optional_slots) < pre_ceiling_count:
-                log.info(f"Price ceiling {max_avg_price:.1f} c/kWh: kept {len(optional_slots)}/{pre_ceiling_count} optional slots")
+                log.debug(f"Price ceiling {max_avg_price:.1f} c/kWh: kept {len(optional_slots)}/{pre_ceiling_count} optional slots")
 
         # =====================================================================
         # Combine and store schedule
@@ -1418,7 +1420,7 @@ def _calculate_and_store_schedule():
         all_selected_slots = mandatory_slots + optional_slots
 
         if not all_selected_slots:
-            log.info("No charging slots selected")
+            log.debug("No charging slots selected")
             _store_schedule([], mode="idle", current_soc=current_soc)
             _update_charging_status(0, "No charging needed")
             return {
@@ -1445,7 +1447,7 @@ def _calculate_and_store_schedule():
         _update_charging_status(1, f"Scheduled: {total_slots} slots, {total_energy:.1f} kWh")
 
         # Log summary
-        log.info(f"Schedule complete: {len(mandatory_slots)} mandatory + "
+        log.debug(f"Schedule complete: {len(mandatory_slots)} mandatory + "
                  f"{len(optional_slots)} optional = {total_slots} total slots")
 
         return {
@@ -1896,6 +1898,13 @@ def tesla_charging_control():
     if not _is_smart_charging_enabled():
         input_select.select_option(entity_id=OUTPUT_SOLAR_AVAILABLE, option='off')
         return
+
+    # Recalculate the schedule every tick against the current (last-known) SOC.
+    # This keeps the stored schedule fresh in the HA UI and, crucially, lets
+    # daytime solar top-ups shrink the night schedule so we don't overcharge.
+    # Cheap and read-only w.r.t. the car (SOC comes from a state sensor, no wake).
+    # Runs regardless of car location, matching on-enable and the daily 15:00 calc.
+    _calculate_and_store_schedule()
 
     is_charging = _is_currently_charging()
 
