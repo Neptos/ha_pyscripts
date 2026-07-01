@@ -199,7 +199,7 @@ def _evaluate_morning_guarantee(bt7, cheap_slots, pool):
                 break
 
         if is_consecutive:
-            cost = sum(iv['price'] for iv in block)
+            cost = sum([iv['price'] for iv in block])
             if cost < best_cost:
                 best_cost = cost
                 best_block = block

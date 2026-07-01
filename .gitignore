@@ -1,0 +1,15 @@
+# Claude Code planning / working dirs (not part of the deploy)
+.claude-work/
+
+# HA automation YAMLs (managed outside this repo)
+automations/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Test / coverage artifacts
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/

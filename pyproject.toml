@@ -1,0 +1,52 @@
+# Dev tooling config for the HA pyscript test suite.
+# Run everything via the Makefile: `make test`, `make coverage`, `make coverage-html`.
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.coverage.run]
+# Measure the deployed pyscript source files, not the tests themselves.
+# `source = ["."]` (rather than an explicit file list) makes coverage statically
+# DISCOVER every root-level .py — so the never-imported files (HotWaterOptimizer,
+# SolarForecast) still appear at 0% instead of silently dropping out and inflating
+# the total. The loader (tests/conftest.py) execs each source under its bare
+# filename, which resolves here because pytest/coverage always run from the repo
+# root (the Makefile guarantees this).
+source = ["."]
+omit = [
+    "tests/*",
+    ".claude-work/*",
+]
+
+[tool.coverage.report]
+show_missing = true
+skip_empty = true
+precision = 1
+
+# Regression floor — `make coverage` FAILS if total drops below this.
+# It is intentionally bounded well under a "typical" 80%: the recorder /
+# state-I/O wrappers, the @service / @time_trigger entry points, and the
+# `_calculate_and_store_schedule` orchestration wrapper are the deliberate
+# MOCK BOUNDARY, untested by design (see planning/context.md OC-4 / OC-5).
+# Tests target the PURE algorithm functions, which are ~fully covered.
+# Ratchet this UP as you add tests; never lower it silently.
+#
+# Current baseline (make coverage):
+#   TeslaSmartCharging.py     ~31%  (pure pricing/energy/control/scheduler fns)
+#   UpdateSpotPriceSensors.py ~30%  (_normalize / _cost / _smoothed)
+#   SolarSavings.py           ~14%  (5 cost/savings fns)
+#   HotWaterOptimizer.py        0%  (pure fns _parse_dt/_normalize_price_data/
+#                                    _select_cheapest_hours are an OPTIONAL
+#                                    future extension — OC-6)
+#   SolarForecast.py            0%  (pure HA boundary; no in-scope pure fns)
+#   TOTAL                     ~24%
+fail_under = 23
+
+exclude_also = [
+    "def __repr__",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+    "@(abc\\.)?abstractmethod",
+]

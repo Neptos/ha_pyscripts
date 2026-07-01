@@ -696,11 +696,15 @@ def _calculate_effective_price(slot_start, buy_price, sell_price):
     return (effective_price, solar_energy_kwh, grid_energy_kwh)
 
 
-def _build_slot_list_with_effective_prices():
+def _build_slot_list_with_effective_prices(now=None, nordpool_attrs=None, sell_attrs=None, effective_price_fn=None):
     """Build list of all available charging slots with effective prices.
 
     Combines Nordpool price data for today and tomorrow (if available) with
     solar forecasts to calculate effective charging costs for each 15-minute slot.
+
+    Args:
+        All four params default to the original live reads when None — inject only
+        for testing; deployed callers pass nothing.
 
     Returns:
         list: List of slot dictionaries, sorted by effective_price (cheapest first).
@@ -719,7 +723,8 @@ def _build_slot_list_with_effective_prices():
 
     try:
         # Get Nordpool price data using state.getattr (safe pattern, no eval)
-        nordpool_attrs = state.getattr(NORDPOOL_SENSOR) or {}
+        if nordpool_attrs is None:
+            nordpool_attrs = state.getattr(NORDPOOL_SENSOR) or {}
 
         raw_today = nordpool_attrs.get('raw_today', [])
         raw_tomorrow = nordpool_attrs.get('raw_tomorrow', [])
@@ -738,7 +743,8 @@ def _build_slot_list_with_effective_prices():
             all_prices.extend(normalized_tomorrow)
 
         # Get sell price data (may be time-varying or flat rate)
-        sell_attrs = state.getattr(SELL_PRICE_SENSOR) or {}
+        if sell_attrs is None:
+            sell_attrs = state.getattr(SELL_PRICE_SENSOR) or {}
         sell_raw_today = sell_attrs.get('raw_today', [])
         sell_raw_tomorrow = sell_attrs.get('raw_tomorrow', [])
         sell_tomorrow_valid = sell_attrs.get('tomorrow_valid', False)
@@ -765,7 +771,10 @@ def _build_slot_list_with_effective_prices():
             sell_price_flat = 0
 
         # Current time for filtering past slots
-        now = datetime.now().astimezone()
+        if now is None:
+            now = datetime.now().astimezone()
+        if effective_price_fn is None:
+            effective_price_fn = _calculate_effective_price
 
         # Build slot list
         max_slot_energy = MAX_CHARGE_RATE_KW * SLOT_DURATION_HOURS
@@ -811,7 +820,7 @@ def _build_slot_list_with_effective_prices():
                     sell_price = buy_price * 0.5
 
             # Calculate effective price with solar
-            effective_price, solar_energy, grid_energy = _calculate_effective_price(
+            effective_price, solar_energy, grid_energy = effective_price_fn(
                 start, buy_price, sell_price
             )
 
