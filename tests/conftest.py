@@ -67,6 +67,8 @@ def load_pyscript(filename):
     """
     src = (pathlib.Path(__file__).parent.parent / filename).read_text()
     mod = types.ModuleType(filename)
+    # Registration is required so freezegun can patch the module's datetime binding.
+    sys.modules[filename] = mod
     for name in (
         "time_trigger", "service", "state_trigger", "log", "state", "task",
         "hass", "pyscript", "input_number", "input_text", "input_boolean",
@@ -77,6 +79,132 @@ def load_pyscript(filename):
     mod.__dict__["dt"] = datetime
     exec(compile(src, filename, "exec"), mod.__dict__)
     return mod
+
+
+class FakeState:
+    """Recording stand-in for pyscript's ``state`` namespace.
+
+    ``get``/``getattr`` mirror the source's read pattern (source does
+    ``state.getattr(...) or {}`` on the attr result, so a missing prime -> None
+    is handled by the caller). ``setattr`` records dotted-key writes and never
+    raises (source wraps its setattr block in try/except; a raising fake would
+    silently leave ``attrs_written`` empty).
+    """
+
+    def __init__(self, get_map, attr_map):
+        self.get_map = get_map
+        self.attr_map = attr_map
+        self.setattr_calls = []
+        self.attrs_written = {}
+
+    def get(self, entity):
+        return self.get_map.get(entity)
+
+    def getattr(self, entity):
+        return self.attr_map.get(entity)
+
+    def setattr(self, dotted_key, value):
+        self.setattr_calls.append((dotted_key, value))
+        self.attrs_written[dotted_key] = value
+
+
+class FakeLog:
+    """Recording stand-in for pyscript's ``log`` namespace.
+
+    Each level appends ``(level, msg)`` to ``self.records``; unknown levels are
+    handled by the ``__getattr__`` fallback returning a recording callable.
+    """
+
+    def __init__(self):
+        self.records = []
+
+    def warning(self, msg):
+        self.records.append(("warning", msg))
+
+    def debug(self, msg):
+        self.records.append(("debug", msg))
+
+    def info(self, msg):
+        self.records.append(("info", msg))
+
+    def error(self, msg):
+        self.records.append(("error", msg))
+
+    def __getattr__(self, level):
+        def _record(msg):
+            self.records.append((level, msg))
+        return _record
+
+
+class FakeInputText:
+    """Recording stand-in for pyscript's ``input_text`` namespace.
+
+    Source writes bare attribute assignments (``input_text.tesla_charging_schedule
+    = summary``); ``__setattr__`` captures ``name -> value`` into ``.writes``.
+    The internal store is set via ``object.__setattr__`` to avoid recursion.
+    """
+
+    def __init__(self):
+        object.__setattr__(self, "_writes", {})
+
+    def __setattr__(self, name, value):
+        self._writes[name] = value
+
+    @property
+    def writes(self):
+        return self._writes
+
+
+class FakeInputNumber:
+    """Recording stand-in for pyscript's ``input_number`` namespace.
+
+    Source writes bare attribute assignments (``input_number.tesla_charging_status
+    = status_code``); ``__setattr__`` captures ``name -> value`` into ``.writes``.
+    The internal store is set via ``object.__setattr__`` to avoid recursion.
+    """
+
+    def __init__(self):
+        object.__setattr__(self, "_writes", {})
+
+    def __setattr__(self, name, value):
+        self._writes[name] = value
+
+    @property
+    def writes(self):
+        return self._writes
+
+
+class _World:
+    """Namespace exposing the injected fakes for assertions."""
+
+    def __init__(self, state, log, input_text, input_number):
+        self.state = state
+        self.log = log
+        self.input_text = input_text
+        self.input_number = input_number
+
+
+@pytest.fixture
+def world(monkeypatch):
+    """Factory injecting recording fakes onto a session-loaded module.
+
+    ``make(mod, get=..., attrs=...)`` monkeypatches ``state``/``log``/
+    ``input_text``/``input_number`` on ``mod`` and returns a ``_World`` exposing
+    them. monkeypatch auto-reverts each test, restoring the ``_Noop`` stubs.
+    """
+
+    def make(mod, *, get=None, attrs=None):
+        fake_state = FakeState(get or {}, attrs or {})
+        fake_log = FakeLog()
+        fake_input_text = FakeInputText()
+        fake_input_number = FakeInputNumber()
+        monkeypatch.setattr(mod, "state", fake_state)
+        monkeypatch.setattr(mod, "log", fake_log)
+        monkeypatch.setattr(mod, "input_text", fake_input_text)
+        monkeypatch.setattr(mod, "input_number", fake_input_number)
+        return _World(fake_state, fake_log, fake_input_text, fake_input_number)
+
+    return make
 
 
 @pytest.fixture(scope="session")
