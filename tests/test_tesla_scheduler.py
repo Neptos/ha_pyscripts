@@ -73,6 +73,25 @@ def test_price_ceiling_respects_max(tesla):
     assert total_cost / total_energy <= max_avg + 1e-9
 
 
+def test_price_ceiling_keeps_cheap_optional_below_ceiling(tesla):
+    """Cheap optional slots below the ceiling are NOT dropped by a high mandatory avg.
+
+    Mandatory 8 slots @20 c/kWh, optional 4 @3 c/kWh, ceiling 8. The combined
+    weighted avg starts above 8, but dropping a 3 c/kWh optional slot only raises
+    the average further, so the break-before-drop guard keeps all 4. Before the
+    guard the loop dropped every optional slot (0 kept).
+    """
+    slot_energy = tesla.MAX_CHARGE_RATE_KW * tesla.SLOT_DURATION_HOURS
+    start = _tz_start()
+    mandatory = _mk_slots(8, [20.0] * 8, start, slot_energy)
+    optional = _mk_slots(4, [3.0] * 4, start + datetime.timedelta(hours=2), slot_energy)
+    ceiling = 8.0
+
+    kept = tesla._apply_price_ceiling(mandatory, optional, ceiling)
+
+    assert len(kept) == 4
+
+
 def test_price_ceiling_empty_optional(tesla):
     slot_energy = tesla.MAX_CHARGE_RATE_KW * tesla.SLOT_DURATION_HOURS
     mandatory = _mk_slots(2, [2.0, 2.0], _tz_start(), slot_energy)

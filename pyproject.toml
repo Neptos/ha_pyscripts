@@ -33,15 +33,14 @@ precision = 1
 # Ratchet this UP as you add tests; never lower it silently.
 #
 # Current baseline (make coverage):
-#   TeslaSmartCharging.py     ~31%  (pure pricing/energy/control/scheduler fns)
-#   UpdateSpotPriceSensors.py ~30%  (_normalize / _cost / _smoothed)
-#   SolarSavings.py           ~14%  (5 cost/savings fns)
-#   HotWaterOptimizer.py        0%  (pure fns _parse_dt/_normalize_price_data/
-#                                    _select_cheapest_hours are an OPTIONAL
-#                                    future extension — OC-6)
+#   UpdateSpotPriceSensors.py ~88%  (_normalize / _cost / _smoothed)
+#   SolarSavings.py           ~74%  (cost/savings fns)
+#   TeslaSmartCharging.py     ~65%  (pure pricing/energy/control/scheduler fns)
+#   HotWaterOptimizer.py      ~41%  (pure fns _parse_dt/_normalize_price_data/
+#                                    _select_cheapest_hours)
 #   SolarForecast.py            0%  (pure HA boundary; no in-scope pure fns)
-#   TOTAL                     ~24%
-fail_under = 23
+#   TOTAL                     ~65%
+fail_under = 62
 
 exclude_also = [
     "def __repr__",

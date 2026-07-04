@@ -20,9 +20,11 @@ def test_normalize_splits_hourly(spot):
     assert len(out) == 4
     for e in out:
         assert e['value'] == 4.2
+        # Output entries carry datetime start/end, not iso strings
+        assert isinstance(e['start'], datetime)
+        assert isinstance(e['end'], datetime)
     # 4th entry starts at :45
-    fourth_start = datetime.fromisoformat(out[3]['start'])
-    assert fourth_start.minute == 45
+    assert out[3]['start'].minute == 45
 
 
 def test_normalize_keeps_15min(spot):
@@ -32,16 +34,19 @@ def test_normalize_keeps_15min(spot):
 
     out = spot._normalize_price_data([entry])
 
+    # Every entry is rebuilt with datetime start/end (canonical semantics),
+    # so it is a fresh dict equal by value, not the same object.
     assert len(out) == 1
-    assert out[0] is entry
+    assert out[0]['value'] == 2.0
+    assert out[0]['start'] == start
+    assert out[0]['end'] == end
 
 
-def test_normalize_keeps_malformed_asis(spot):
-    # missing 'end' and 'value' -> passes through unchanged
+def test_normalize_drops_malformed(spot):
+    # missing 'end' and 'value' -> dropped with a warning
     entry = {'start': 'whatever'}
     out = spot._normalize_price_data([entry])
-    assert len(out) == 1
-    assert out[0] is entry
+    assert out == []
 
 
 def test_cost_for_price_buckets(spot):

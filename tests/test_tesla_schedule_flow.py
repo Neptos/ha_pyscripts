@@ -375,6 +375,81 @@ def test_stored_attributes_correct(tesla, world):
         assert isinstance(w.input_number.writes["tesla_charging_status"], int)
 
 
+# --- Scenario 9: charge-limit-unavailable fallback ---------------------------
+
+
+def test_charge_limit_unavailable_falls_back_to_mandatory(tesla, world):
+    """SOC known but charge limit unset -> mandatory-only schedule, not abort.
+
+    Before the fallback, a missing charge limit returned {'success': False}. Now
+    it falls back to MIN_SOC_GUARANTEE so the mandatory 50% guarantee is still
+    scheduled (mode scheduled_mandatory).
+    """
+    with freeze_time("2026-01-15 22:00:00"):
+        tz = _local_tz()
+        base = datetime.datetime(2026, 1, 15, 23, 0, 0, tzinfo=tz)
+        prices = [2.0] * 24
+        get = {
+            tesla.TESLA_BATTERY_LEVEL: "30",
+            # TESLA_CHARGE_LIMIT intentionally unset -> _get_charge_limit None.
+            tesla.OUTDOOR_TEMP_SENSOR: "10",
+            tesla.OUTPUT_MAX_AVG_PRICE: "0",
+            tesla.SELL_PRICE_SENSOR: "2.0",
+        }
+        attrs = {tesla.NORDPOOL_SENSOR: _nordpool_attrs(_price_entries(base, prices))}
+        w = world(tesla, get=get, attrs=attrs)
+
+        result = tesla._calculate_and_store_schedule()
+
+        assert result["success"] is True
+        assert result["mandatory_slots"]
+        assert result["optional_slots"] == []
+        assert _mode_written(w) == "scheduled_mandatory"
+
+
+# --- L6 flap regression ------------------------------------------------------
+
+
+def test_controller_writes_status_at_most_once(tesla, world):
+    """L6: a full tesla_charging_control tick writes tesla_charging_status <= 1x.
+
+    Before the fix, the per-tick _calculate_and_store_schedule() wrote status 1
+    (Scheduled) and then the controller overwrote it (2 or 0), producing a
+    visible 2->1->2 flap. With update_status=False on the internal recalc, only
+    the controller's final _update_charging_status writes the status entity.
+    """
+    with freeze_time("2026-01-15 22:00:00"):
+        tz = _local_tz()
+        base = datetime.datetime(2026, 1, 15, 23, 0, 0, tzinfo=tz)
+        prices = [2.0] * 24
+        get = {
+            tesla.OUTPUT_SMART_CHARGING_ENABLED: "on",
+            tesla.TESLA_LOCATION: "home",
+            tesla.TESLA_CHARGE_CABLE: "on",
+            tesla.TESLA_CHARGING_STATE: "stopped",
+            tesla.TESLA_BATTERY_LEVEL: "30",
+            tesla.TESLA_CHARGE_LIMIT: "80",
+            tesla.OUTDOOR_TEMP_SENSOR: "10",
+            tesla.OUTPUT_MAX_AVG_PRICE: "0",
+            tesla.SELL_PRICE_SENSOR: "2.0",
+            tesla.TESLA_CHARGE_CURRENT: "0",
+            tesla.GRID_POWER_15MIN_AVG: "-500",
+            tesla.GRID_POWER_CURRENT: "-500",
+            tesla.SUN_NEXT_RISING: "2026-01-16T06:00:00+02:00",
+            tesla.SUN_NEXT_SETTING: "2026-01-16T16:00:00+02:00",
+        }
+        attrs = {tesla.NORDPOOL_SENSOR: _nordpool_attrs(_price_entries(base, prices))}
+        w = world(tesla, get=get, attrs=attrs)
+
+        tesla.tesla_charging_control()
+
+        status_writes = [
+            e for e in w.input_number.write_log
+            if e[0].endswith("tesla_charging_status")
+        ]
+        assert len(status_writes) <= 1
+
+
 # --- Micro-coverage: _get_next_deadline --------------------------------------
 
 

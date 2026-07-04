@@ -8,11 +8,9 @@ CPython, so we stub them: ``_Noop`` covers the injected globals, and a
 source files ``exec`` cleanly so their pure functions can be unit-tested.
 """
 
-import datetime
 import pathlib
 import sys
 import types
-import typing
 
 import pytest
 
@@ -57,9 +55,7 @@ def load_pyscript(filename):
     """Load a HA pyscript source file as a module under plain CPython.
 
     Reads the source relative to the repo root, seeds a fresh module namespace
-    with the pyscript magic globals (as ``_Noop`` stubs) plus ``Literal`` and
-    ``dt`` (used unimported in def-time annotations by the recorder scripts),
-    then execs the source.
+    with the pyscript magic globals (as ``_Noop`` stubs), then execs the source.
 
     Mock boundary is import-only: ``_Noop`` silently swallows attribute access,
     so do NOT rely on its return values in assertions. The loader never
@@ -75,8 +71,6 @@ def load_pyscript(filename):
         "input_select", "sensor", "switch", "number", "binary_sensor",
     ):
         mod.__dict__[name] = _Noop()
-    mod.__dict__["Literal"] = typing.Literal
-    mod.__dict__["dt"] = datetime
     exec(compile(src, filename, "exec"), mod.__dict__)
     return mod
 
@@ -96,6 +90,19 @@ class FakeState:
         self.attr_map = attr_map
         self.setattr_calls = []
         self.attrs_written = {}
+        self.set_calls = []
+        self.set_kwargs = []
+
+    def set(self, entity, value=None, new_attributes=None, **kwargs):
+        self.set_calls.append((entity, value))
+        self.set_kwargs.append((entity, kwargs))
+        # Merge kwargs attributes (pyscript state.set(name, **kwargs) merges).
+        for k, v in kwargs.items():
+            self.attrs_written[f"{entity}.{k}"] = v
+        # Only overwrite the state value when one was actually provided;
+        # a kwargs-only merge call must not clobber the entity value to None.
+        if value is not None:
+            self.get_map[entity] = value
 
     def get(self, entity):
         return self.get_map.get(entity)
@@ -155,19 +162,48 @@ class FakeInputText:
         return self._writes
 
 
+class _InputNumberAttrProxy:
+    """Per-entity proxy recording dotted-attribute writes.
+
+    HotWaterOptimizer writes dotted attrs like
+    ``input_number.hot_water_heating_status.reason = ...`` (Tesla never does).
+    Each ``__setattr__`` records ``f"{entity}.{attr}" -> value`` into the
+    parent's ``attr_writes`` dict.
+    """
+
+    def __init__(self, parent, entity):
+        object.__setattr__(self, "_parent", parent)
+        object.__setattr__(self, "_entity", entity)
+
+    def __setattr__(self, attr, value):
+        self._parent.attr_writes[f"{self._entity}.{attr}"] = value
+
+
 class FakeInputNumber:
     """Recording stand-in for pyscript's ``input_number`` namespace.
 
     Source writes bare attribute assignments (``input_number.tesla_charging_status
     = status_code``); ``__setattr__`` captures ``name -> value`` into ``.writes``.
-    The internal store is set via ``object.__setattr__`` to avoid recursion.
+    Dotted-attribute writes (``input_number.<entity>.<attr> = value``) go through
+    a per-entity proxy returned by ``__getattr__`` and land in ``attr_writes``.
+    ``write_log`` appends ``(name, value)`` on EVERY value write (the ``writes``
+    dict is last-value-per-key, so write COUNTS are only observable via
+    ``write_log``). The internal stores are set via ``object.__setattr__`` to
+    avoid recursion.
     """
 
     def __init__(self):
         object.__setattr__(self, "_writes", {})
+        object.__setattr__(self, "attr_writes", {})
+        object.__setattr__(self, "write_log", [])
 
     def __setattr__(self, name, value):
         self._writes[name] = value
+        self.write_log.append((name, value))
+
+    def __getattr__(self, name):
+        # Only reached for names not set via __setattr__ (i.e. not in __dict__).
+        return _InputNumberAttrProxy(self, name)
 
     @property
     def writes(self):
@@ -220,3 +256,8 @@ def spot():
 @pytest.fixture(scope="session")
 def savings():
     return load_pyscript("SolarSavings.py")
+
+
+@pytest.fixture(scope="session")
+def hotwater():
+    return load_pyscript("HotWaterOptimizer.py")

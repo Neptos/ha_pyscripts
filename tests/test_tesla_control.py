@@ -110,3 +110,76 @@ def test_effective_surplus_asymmetry(tesla):
     assert tesla._get_effective_surplus(
         is_charging=False, grid_power_instant=1000, grid_power_avg=500, tesla_power_w=300
     ) == 500
+
+
+def test_grid_sensor_unavailable_stops_when_charging(tesla):
+    """M3: charging + None surplus in daylight -> stop 'Grid sensor unavailable'.
+
+    Before the fix, a coerced-0 grid read let _get_effective_surplus return the
+    (0 + tesla_draw) pure-solar path; a None surplus now short-circuits to stop.
+    """
+    action = tesla._compute_desired_action(
+        is_in_slot=False,
+        is_charging=True,
+        is_daylight=True,
+        surplus_watts=None,
+        buy_price=10,
+        sell_price=2,
+        price_threshold=5,
+    )
+    assert action['type'] == 'stop'
+    assert action['status_msg'] == 'Grid sensor unavailable'
+
+
+def test_grid_sensor_unavailable_noops_when_not_charging(tesla):
+    """Not charging + None surplus in daylight -> noop 'Grid sensor unavailable'."""
+    action = tesla._compute_desired_action(
+        is_in_slot=False,
+        is_charging=False,
+        is_daylight=True,
+        surplus_watts=None,
+        buy_price=10,
+        sell_price=2,
+        price_threshold=5,
+    )
+    assert action['type'] == 'noop'
+    assert action['status_msg'] == 'Grid sensor unavailable'
+
+
+def test_scheduled_slot_unaffected_by_grid_outage(tesla):
+    """Scheduled-slot charging (tier 1) ignores a None surplus."""
+    action = tesla._compute_desired_action(
+        is_in_slot=True,
+        is_charging=False,
+        is_daylight=True,
+        surplus_watts=None,
+        buy_price=None,
+        sell_price=None,
+        price_threshold=None,
+    )
+    assert action['type'] == 'charge'
+    assert action['amps'] == tesla.MAX_CHARGE_AMPS
+
+
+def test_effective_surplus_none_when_grid_unavailable(tesla):
+    # charging + instant None -> None
+    assert tesla._get_effective_surplus(True, None, 500, 9000) is None
+    # not charging + avg None -> None
+    assert tesla._get_effective_surplus(False, 1000, None, 300) is None
+
+
+def test_gather_controller_inputs_grid_unavailable(tesla, world):
+    """_gather_controller_inputs: 'unavailable' grid -> None + warning logged."""
+    get = {
+        tesla.GRID_POWER_CURRENT: "unavailable",
+        tesla.GRID_POWER_15MIN_AVG: "500",
+        tesla.TESLA_CHARGER_POWER: "0",
+    }
+    w = world(tesla, get=get)
+
+    inputs = tesla._gather_controller_inputs()
+
+    assert inputs['grid_power_instant'] is None
+    warnings = [msg for (lvl, msg) in w.log.records
+                if lvl == "warning" and "Grid power sensor unavailable" in str(msg)]
+    assert warnings

@@ -113,7 +113,7 @@ entity IDs before deployment.
 ================================================================================
 """
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import json
 
 # =============================================================================
@@ -198,7 +198,7 @@ TESLA_CHARGE_LIMIT = "number.charge_limit"
 NORDPOOL_SENSOR = "sensor.nordpool_kwh_fi_eur_3_10_0"
 SELL_PRICE_SENSOR = "sensor.electricity_sell_price"
 
-# --- Solar Forecast Entities (Solcast) ---
+# --- Solar Forecast Entities (Forecast.Solar) ---
 SOLAR_REMAINING_TODAY = "sensor.energy_production_today_remaining"
 SOLAR_PRODUCTION_TOMORROW = "sensor.energy_production_tomorrow"
 
@@ -221,44 +221,56 @@ OUTPUT_SOLAR_AVAILABLE = "input_select.tesla_solar_charging_available"
 # UTILITY FUNCTIONS
 # =============================================================================
 
+def _parse_dt(value):
+    """Parse a datetime value from string, timestamp, or pass through datetime."""
+    if isinstance(value, str):
+        return datetime.fromisoformat(value.replace('Z', '+00:00'))
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(value, tz=timezone.utc)
+    return value
+
+
 def _normalize_price_data(price_dictionaries):
-    """Normalize price data to 15-minute intervals.
+    """Normalize price data to 15-minute intervals with datetime objects.
 
     Handles mixed format where some entries may span a full hour (due to timezone
     differences) by splitting hourly entries into 4 equal 15-minute prices.
 
-    Copied from UpdateSpotPriceSensors.py for consistency.
+    Entries missing start/end/value, or whose start/end cannot be parsed, are
+    dropped with a warning. Output entries always carry datetime start/end; the
+    value passes through untouched.
+
+    Canonical shared helper: this function's source text is kept byte-identical
+    across the deployed scripts and is enforced by tests/test_shared_helper_drift.py.
     """
     normalized = []
 
     for entry in price_dictionaries:
         if 'start' not in entry or 'end' not in entry or 'value' not in entry:
-            # Keep entries without proper start/end/value as-is
-            normalized.append(entry)
+            log.warning(f"Skipping malformed price entry: {entry}")
             continue
 
-        # Handle both string and datetime objects
-        start = entry['start']
-        if isinstance(start, str):
-            start = datetime.fromisoformat(start.replace('Z', '+00:00'))
-        end = entry['end']
-        if isinstance(end, str):
-            end = datetime.fromisoformat(end.replace('Z', '+00:00'))
-        duration_minutes = (end - start).total_seconds() / 60
+        try:
+            start = _parse_dt(entry['start'])
+            end = _parse_dt(entry['end'])
+            duration_minutes = (end - start).total_seconds() / 60
+        except (ValueError, TypeError, AttributeError):
+            log.warning(f"Skipping malformed price entry: {entry}")
+            continue
 
-        # If duration is roughly 1 hour (allow small variations), split into 4x15min
         if duration_minutes > 45:
             for i in range(4):
-                interval_start = start + timedelta(minutes=15 * i)
-                interval_end = start + timedelta(minutes=15 * (i + 1))
                 normalized.append({
-                    'start': interval_start.isoformat(),
-                    'end': interval_end.isoformat(),
+                    'start': start + timedelta(minutes=15 * i),
+                    'end': start + timedelta(minutes=15 * (i + 1)),
                     'value': entry['value']
                 })
         else:
-            # Already 15-minute (or other) interval, keep as-is
-            normalized.append(entry)
+            normalized.append({
+                'start': start,
+                'end': end,
+                'value': entry['value']
+            })
 
     return normalized
 
@@ -486,7 +498,7 @@ def _calculate_blended_effective_price(excess_solar_w, buy_price, sell_price):
     if excess_solar_w is None or excess_solar_w < 0:
         excess_solar_w = 0.0
 
-    if buy_price is None or buy_price < 0:
+    if buy_price is None:
         # If no buy price available, can't calculate - return a high default
         return 999.0
 
@@ -579,26 +591,54 @@ def _is_during_daylight():
     return sunrise <= now <= sunset
 
 
-def _get_solar_forecast_for_slot(slot_start):
+def _get_solar_forecast_for_slot(slot_start, ctx=None):
     """Estimate solar production (kW) for a 15-minute slot.
 
-    Uses daily forecast from Solcast distributed across daylight hours via solar curve.
-    Applies confidence factor to be conservative with forecasts.
+    Uses daily forecast from the Forecast.Solar integration distributed across
+    daylight hours via solar curve. Applies confidence factor to be conservative
+    with forecasts.
 
     The key insight: for a 1-hour period, kWh = kW average. So if a slot has
     2 kWh of production in 1 hour, that means 2 kW average power during that hour.
 
     Args:
         slot_start: datetime of slot start (timezone-aware)
+        ctx: optional dict {sunrise, sunset, now, today_kwh, tomorrow_kwh} of
+            per-build invariants, hoisted out of the slot loop by the caller.
+            When None, each value is read live (current behavior). Fallback
+            semantics are identical to the live path in both branches (e.g.
+            sunrise/sunset None -> daylight gate skipped).
 
     Returns:
         float: Estimated average solar power in kW for the slot (after baseload)
     """
     try:
-        # Check if slot is during daylight hours - no solar outside sunrise/sunset
-        sunrise, sunset = _get_sunrise_sunset()
+        # Check if slot is during daylight hours - no solar outside sunrise/sunset.
+        # The sun sensors report the NEXT rising/setting instant, which for a
+        # multi-day slot list can be in inverted (daytime) order. Rather than
+        # compare against those raw instants, project their wall-clock time onto
+        # the slot's own date and gate on that per-day daylight window.
+        #
+        # Assumptions:
+        #  (a) Reusing the wall-clock time across days is a ±2 min/day proxy for
+        #      the true civil sunrise/sunset (solstices excepted); good enough for
+        #      a solar-forecast gate.
+        #  (b) Correctness depends on _get_sunrise_sunset()'s returned datetimes
+        #      carrying per-instant-correct UTC offsets (HA's sun integration
+        #      guarantees this); .astimezone() between two independently-correct
+        #      fixed offsets is exact arithmetic.
+        if ctx is not None:
+            sunrise, sunset = ctx['sunrise'], ctx['sunset']
+        else:
+            sunrise, sunset = _get_sunrise_sunset()
         if sunrise and sunset:
-            if slot_start < sunrise or slot_start >= sunset:
+            sr = sunrise.astimezone(slot_start.tzinfo)
+            ss = sunset.astimezone(slot_start.tzinfo)
+            slot_sunrise = slot_start.replace(
+                hour=sr.hour, minute=sr.minute, second=0, microsecond=0)
+            slot_sunset = slot_start.replace(
+                hour=ss.hour, minute=ss.minute, second=0, microsecond=0)
+            if not (slot_sunrise <= slot_start < slot_sunset):
                 return 0.0
 
         # Get the hour for the slot
@@ -609,24 +649,36 @@ def _get_solar_forecast_for_slot(slot_start):
             return 0.0
 
         # Determine which day's forecast to use
-        now = datetime.now().astimezone()
+        if ctx is not None:
+            now = ctx['now']
+        else:
+            now = datetime.now().astimezone()
         today = now.date()
         slot_date = slot_start.date()
 
         if slot_date == today:
             # Use remaining production for today
-            raw = state.get(SOLAR_REMAINING_TODAY)
+            if ctx is not None:
+                raw = ctx['today_kwh']
+            else:
+                raw = state.get(SOLAR_REMAINING_TODAY)
             daily_forecast_kwh = float(raw) if raw not in (None, 'unavailable', 'unknown') else 0.0
+            # Renormalize the curve fraction over the remaining hours: the
+            # "remaining today" forecast covers only hours from `now` onward, so
+            # the full-day curve fractions must be rescaled to sum over those.
+            remaining_sum = sum([SOLAR_CURVE[h] for h in SOLAR_CURVE if h >= now.hour])
+            hour_fraction = SOLAR_CURVE.get(slot_hour, 0.0) / remaining_sum if remaining_sum > 0 else 0.0
         elif slot_date == today + timedelta(days=1):
-            # Use tomorrow's full forecast
-            raw = state.get(SOLAR_PRODUCTION_TOMORROW)
+            # Use tomorrow's full forecast (full-day curve fraction)
+            if ctx is not None:
+                raw = ctx['tomorrow_kwh']
+            else:
+                raw = state.get(SOLAR_PRODUCTION_TOMORROW)
             daily_forecast_kwh = float(raw) if raw not in (None, 'unavailable', 'unknown') else 0.0
+            hour_fraction = SOLAR_CURVE.get(slot_hour, 0.0)
         else:
             # No forecast available for this date
             return 0.0
-
-        # Get the fraction of daily production for this hour
-        hour_fraction = SOLAR_CURVE.get(slot_hour, 0.0)
 
         # Calculate kWh for this hour
         # For a 1-hour period: kWh produced = kW average power
@@ -644,7 +696,7 @@ def _get_solar_forecast_for_slot(slot_start):
         return 0.0
 
 
-def _calculate_effective_price(slot_start, buy_price, sell_price):
+def _calculate_effective_price(slot_start, buy_price, sell_price, solar_ctx=None):
     """Calculate effective charging cost accounting for solar availability.
 
     When solar is available, charging can use free solar power. When solar is
@@ -660,6 +712,8 @@ def _calculate_effective_price(slot_start, buy_price, sell_price):
         slot_start: datetime of slot start (timezone-aware)
         buy_price: Grid electricity buy price (c/kWh)
         sell_price: Solar export/sell price (c/kWh)
+        solar_ctx: optional per-build invariant dict threaded to
+            _get_solar_forecast_for_slot (see its docstring); None -> live reads.
 
     Returns:
         tuple: (effective_price_per_kwh, solar_energy_kwh, grid_energy_kwh)
@@ -671,7 +725,7 @@ def _calculate_effective_price(slot_start, buy_price, sell_price):
     max_slot_energy_kwh = MAX_CHARGE_RATE_KW * SLOT_DURATION_HOURS
 
     # Get available solar power for this slot
-    solar_available_kw = _get_solar_forecast_for_slot(slot_start)
+    solar_available_kw = _get_solar_forecast_for_slot(slot_start, ctx=solar_ctx)
 
     # Calculate how much of the charging can be covered by solar
     solar_energy_kwh = min(solar_available_kw * SLOT_DURATION_HOURS, max_slot_energy_kwh)
@@ -749,7 +803,14 @@ def _build_slot_list_with_effective_prices(now=None, nordpool_attrs=None, sell_a
         sell_raw_tomorrow = sell_attrs.get('raw_tomorrow', [])
         sell_tomorrow_valid = sell_attrs.get('tomorrow_valid', False)
 
-        # Build sell price lookup (keyed by ISO timestamp)
+        # Build sell price lookup (keyed by epoch-second of the slot start, so
+        # lookups are representation-independent: 'Z' strings, +HH:MM strings,
+        # aware and naive datetimes for the same instant all hit).
+        #
+        # _normalize_price_data (Step 2 canonical semantics) always outputs
+        # datetime `start`/`end`, so production data reaching this loop carries
+        # datetimes; the isinstance(start, str) branch below is defensive/legacy
+        # (raw ISO-string) handling only.
         sell_lookup = {}
         if sell_raw_today:
             sell_normalized = _normalize_price_data(sell_raw_today)
@@ -762,7 +823,9 @@ def _build_slot_list_with_effective_prices(now=None, nordpool_attrs=None, sell_a
                         start_dt = datetime.fromisoformat(start.replace('Z', '+00:00'))
                     else:
                         start_dt = start
-                    sell_lookup[start_dt.isoformat()] = entry['value']
+                    if start_dt.tzinfo is None:
+                        start_dt = start_dt.astimezone()
+                    sell_lookup[int(start_dt.timestamp())] = entry['value']
 
         # Flat rate fallback for sell price
         try:
@@ -774,66 +837,86 @@ def _build_slot_list_with_effective_prices(now=None, nordpool_attrs=None, sell_a
         if now is None:
             now = datetime.now().astimezone()
         if effective_price_fn is None:
-            effective_price_fn = _calculate_effective_price
+            # Hoist the per-build solar invariants out of the slot loop: read
+            # sunrise/sunset, now, and the two forecast sensors ONCE (all are
+            # constant within a single build) and thread them through as ctx.
+            sunrise, sunset = _get_sunrise_sunset()
+            solar_ctx = {
+                'sunrise': sunrise,
+                'sunset': sunset,
+                'now': now,
+                'today_kwh': state.get(SOLAR_REMAINING_TODAY),
+                'tomorrow_kwh': state.get(SOLAR_PRODUCTION_TOMORROW),
+            }
+            effective_price_fn = lambda s, b, sp: _calculate_effective_price(s, b, sp, solar_ctx=solar_ctx)
 
         # Build slot list
         max_slot_energy = MAX_CHARGE_RATE_KW * SLOT_DURATION_HOURS
 
         for price_entry in all_prices:
-            if 'start' not in price_entry or 'value' not in price_entry:
-                continue
+            # Per-entry safety: one bad entry (e.g. value=None) shrinks the pool
+            # by 1 instead of aborting the whole build.
+            try:
+                if 'start' not in price_entry or 'value' not in price_entry:
+                    continue
 
-            # Parse start time
-            start = price_entry['start']
-            if isinstance(start, str):
-                start = datetime.fromisoformat(start.replace('Z', '+00:00'))
-            elif not hasattr(start, 'tzinfo') or start.tzinfo is None:
-                # Make naive datetime timezone-aware (assume local)
-                start = start.astimezone()
+                # Parse start time. _normalize_price_data (Step 2 canonical
+                # semantics) always outputs datetime `start`/`end`, so production
+                # data here carries datetimes; the isinstance(start, str) branch
+                # is defensive/legacy (raw ISO-string) handling only.
+                start = price_entry['start']
+                if isinstance(start, str):
+                    start = datetime.fromisoformat(start.replace('Z', '+00:00'))
+                elif not hasattr(start, 'tzinfo') or start.tzinfo is None:
+                    # Make naive datetime timezone-aware (assume local)
+                    start = start.astimezone()
 
-            # Parse end time
-            end = price_entry.get('end')
-            if end:
-                if isinstance(end, str):
-                    end = datetime.fromisoformat(end.replace('Z', '+00:00'))
-                elif not hasattr(end, 'tzinfo') or end.tzinfo is None:
-                    end = end.astimezone()
-            else:
-                end = start + SLOT_DURATION
-
-            # Skip only fully-elapsed slots. The current partial slot is kept
-            # (treated as a full slot) so per-tick recalculation in
-            # tesla_charging_control can still select the slot we're charging in.
-            if end <= now:
-                continue
-
-            buy_price = float(price_entry['value'])
-
-            # Look up sell price for this slot (time-varying), fall back to flat rate
-            sell_price = sell_lookup.get(start.isoformat())
-            if sell_price is None:
-                # Fall back to flat rate, or if no flat rate, estimate from buy price
-                if sell_price_flat > 0:
-                    sell_price = sell_price_flat
+                # Parse end time (same canonical-datetime rationale as `start`).
+                end = price_entry.get('end')
+                if end:
+                    if isinstance(end, str):
+                        end = datetime.fromisoformat(end.replace('Z', '+00:00'))
+                    elif not hasattr(end, 'tzinfo') or end.tzinfo is None:
+                        end = end.astimezone()
                 else:
-                    # Conservative estimate: sell price typically ~50% of buy price
-                    sell_price = buy_price * 0.5
+                    end = start + SLOT_DURATION
 
-            # Calculate effective price with solar
-            effective_price, solar_energy, grid_energy = effective_price_fn(
-                start, buy_price, sell_price
-            )
+                # Skip only fully-elapsed slots. The current partial slot is kept
+                # (treated as a full slot) so per-tick recalculation in
+                # tesla_charging_control can still select the slot we're charging in.
+                if end <= now:
+                    continue
 
-            slots.append({
-                'start': start,
-                'end': end,
-                'buy_price': buy_price,
-                'sell_price': sell_price,
-                'effective_price': effective_price,
-                'solar_energy': solar_energy,
-                'grid_energy': grid_energy,
-                'energy': max_slot_energy,
-            })
+                buy_price = float(price_entry['value'])
+
+                # Look up sell price for this slot (time-varying), fall back to flat rate
+                sell_price = sell_lookup.get(int(start.timestamp()))
+                if sell_price is None:
+                    # Fall back to flat rate, or if no flat rate, estimate from buy price
+                    if sell_price_flat > 0:
+                        sell_price = sell_price_flat
+                    else:
+                        # Conservative estimate: sell price typically ~50% of buy price
+                        sell_price = buy_price * 0.5
+
+                # Calculate effective price with solar
+                effective_price, solar_energy, grid_energy = effective_price_fn(
+                    start, buy_price, sell_price
+                )
+
+                slots.append({
+                    'start': start,
+                    'end': end,
+                    'buy_price': buy_price,
+                    'sell_price': sell_price,
+                    'effective_price': effective_price,
+                    'solar_energy': solar_energy,
+                    'grid_energy': grid_energy,
+                    'energy': max_slot_energy,
+                })
+            except Exception as e:
+                log.warning(f"Skipping bad price entry: {e}")
+                continue
 
         # Sort by effective price (cheapest first)
         slots.sort(key=lambda s: s['effective_price'])
@@ -1065,6 +1148,11 @@ def _apply_price_ceiling(mandatory_slots, optional_slots, max_avg_price):
         avg = total_cost / total_energy if total_energy > 0 else 0.0
         if avg <= max_avg_price:
             break
+        # Never drop a slot that is at/below the current average or the ceiling:
+        # dropping such a slot would only raise the average, and a slot priced
+        # within budget is wanted.
+        if optional[0]['effective_price'] <= max(avg, max_avg_price):
+            break
         dropped = optional.pop(0)  # Drop most expensive
         log.debug(f"Price ceiling: dropped slot at {dropped['start'].strftime('%H:%M')} "
                  f"({dropped['effective_price']:.2f} c/kWh)")
@@ -1075,8 +1163,8 @@ def _apply_price_ceiling(mandatory_slots, optional_slots, max_avg_price):
 def _store_schedule(schedule_slots, mode, current_soc=None):
     """Store the charging schedule to Home Assistant entities.
 
-    Stores the schedule as JSON in the input_text entity, with metadata
-    stored as attributes on the input_number status entity.
+    Stores a human-readable summary in the input_text entity, and the full JSON
+    schedule plus metadata as attributes on the input_number status entity.
 
     Args:
         schedule_slots: List of selected slot dictionaries
@@ -1115,8 +1203,10 @@ def _store_schedule(schedule_slots, mode, current_soc=None):
             if slot['solar_energy'] > SOLAR_SLOT_COUNT_THRESHOLD_KWH:
                 solar_slots_count += 1
 
-        # Sort by start time for storage (even though we selected by price)
-        slots_json.sort(key=lambda s: s['start'])
+        # Sort by start time for storage (even though we selected by price).
+        # Parse to datetime so mixed UTC offsets sort chronologically, not
+        # lexicographically on the ISO strings.
+        slots_json.sort(key=lambda s: datetime.fromisoformat(s['start']))
 
         # Build schedule object
         schedule_data = {
@@ -1207,21 +1297,29 @@ def _store_schedule(schedule_slots, mode, current_soc=None):
         except Exception as e:
             log.warning(f"Error storing schedule summary to input_text: {e}")
 
-        # Store full schedule and metadata as attributes on status sensor
+        # Store full schedule and metadata as attributes on status sensor.
+        # One state.set(name, **kwargs) call MERGES these attributes (pyscript
+        # semantics — verified against the reference docs); it must NOT use
+        # new_attributes= (full replace), which would clobber .message /
+        # .last_updated / .charging_started_at / .charging_amps that other
+        # functions own on this entity.
         try:
-            state.setattr(OUTPUT_CHARGING_STATUS + ".schedule_json", schedule_json)
-            state.setattr(OUTPUT_CHARGING_STATUS + ".slot_count", len(slots_json))
-            state.setattr(OUTPUT_CHARGING_STATUS + ".solar_slots_count", solar_slots_count)
-            state.setattr(OUTPUT_CHARGING_STATUS + ".estimated_cost_eur", round(total_cost, 4))
-            state.setattr(OUTPUT_CHARGING_STATUS + ".last_calculated", now.isoformat())
-            state.setattr(OUTPUT_CHARGING_STATUS + ".mode", mode)
-            state.setattr(OUTPUT_CHARGING_STATUS + ".avg_price_c_kwh", avg_price_c_kwh)
+            attrs = {
+                'schedule_json': schedule_json,
+                'slot_count': len(slots_json),
+                'solar_slots_count': solar_slots_count,
+                'estimated_cost_eur': round(total_cost, 4),
+                'last_calculated': now.isoformat(),
+                'mode': mode,
+                'avg_price_c_kwh': avg_price_c_kwh,
+            }
             if expected_soc is not None:
-                state.setattr(OUTPUT_CHARGING_STATUS + ".expected_soc", expected_soc)
-
+                attrs['expected_soc'] = expected_soc
             if slots_json:
-                state.setattr(OUTPUT_CHARGING_STATUS + ".next_slot_start", slots_json[0]['start'])
-                state.setattr(OUTPUT_CHARGING_STATUS + ".schedule_end", slots_json[-1]['end'])
+                attrs['next_slot_start'] = slots_json[0]['start']
+                attrs['schedule_end'] = slots_json[-1]['end']
+
+            state.set(OUTPUT_CHARGING_STATUS, **attrs)
 
             log.debug(f"Stored schedule: {len(slots_json)} slots, {solar_slots_count} solar, "
                      f"estimated cost: {total_cost:.4f} EUR, mode: {mode}")
@@ -1232,7 +1330,7 @@ def _store_schedule(schedule_slots, mode, current_soc=None):
         log.warning(f"Error in _store_schedule: {e}")
 
 
-def _calculate_and_store_schedule():
+def _calculate_and_store_schedule(update_status=True):
     """Calculate optimal charging schedule using two-pass greedy selection.
 
     Algorithm:
@@ -1242,6 +1340,10 @@ def _calculate_and_store_schedule():
     4. Price ceiling: Drop most expensive optional slots until avg <= max.
 
     The schedule is stored to HA entities for the tesla_charging_control controller to use.
+
+    When `update_status` is False (the per-tick controller call), the status-code
+    writes here are suppressed so the controller's own final _update_charging_status
+    is the only status write per tick — this kills the 2->1->2 status flap.
 
     Returns:
         dict: Schedule result with keys:
@@ -1257,13 +1359,18 @@ def _calculate_and_store_schedule():
 
         if current_soc is None:
             log.warning("Cannot calculate schedule: Current SOC unavailable")
-            _update_charging_status(-1, "SOC unavailable")
+            if update_status:
+                _update_charging_status(-1, "SOC unavailable")
             return {'success': False, 'message': "SOC unavailable"}
 
         if charge_limit is None:
-            log.warning("Cannot calculate schedule: Charge limit unavailable")
-            _update_charging_status(-1, "Charge limit unavailable")
-            return {'success': False, 'message': "Charge limit unavailable"}
+            # SOC is available (checked above) but the charge-limit read failed.
+            # Fall back to scheduling only the mandatory 50% guarantee rather
+            # than aborting entirely.
+            charge_limit = MIN_SOC_GUARANTEE
+            log.warning(
+                "Charge limit unavailable - scheduling mandatory charge only "
+                f"(fallback limit {MIN_SOC_GUARANTEE}%)")
 
         log.debug(f"Calculating schedule: SOC={current_soc}%, limit={charge_limit}%, "
                  f"min_guarantee={MIN_SOC_GUARANTEE}%")
@@ -1272,7 +1379,8 @@ def _calculate_and_store_schedule():
         if current_soc >= charge_limit:
             log.debug("Already at or above charge limit, no charging needed")
             _store_schedule([], mode="complete", current_soc=current_soc)
-            _update_charging_status(5, "Target SOC reached")
+            if update_status:
+                _update_charging_status(5, "Target SOC reached")
             return {
                 'success': True,
                 'mandatory_slots': [],
@@ -1290,7 +1398,8 @@ def _calculate_and_store_schedule():
 
         if not all_slots:
             log.warning("No price slots available, cannot calculate schedule")
-            _update_charging_status(-1, "No price data")
+            if update_status:
+                _update_charging_status(-1, "No price data")
             return {'success': False, 'message': "No price data available"}
 
         # =====================================================================
@@ -1325,7 +1434,8 @@ def _calculate_and_store_schedule():
 
             if not slots_before_deadline:
                 log.warning("No slots available before deadline for mandatory charging!")
-                _update_charging_status(-1, "No slots before deadline")
+                if update_status:
+                    _update_charging_status(-1, "No slots before deadline")
                 return {
                     'success': False,
                     'message': "No charging slots available before deadline"
@@ -1431,7 +1541,8 @@ def _calculate_and_store_schedule():
         if not all_selected_slots:
             log.debug("No charging slots selected")
             _store_schedule([], mode="idle", current_soc=current_soc)
-            _update_charging_status(0, "No charging needed")
+            if update_status:
+                _update_charging_status(0, "No charging needed")
             return {
                 'success': True,
                 'mandatory_slots': [],
@@ -1453,7 +1564,8 @@ def _calculate_and_store_schedule():
         # Update status
         total_slots = len(all_selected_slots)
         total_energy = sum([s['energy'] for s in all_selected_slots])
-        _update_charging_status(1, f"Scheduled: {total_slots} slots, {total_energy:.1f} kWh")
+        if update_status:
+            _update_charging_status(1, f"Scheduled: {total_slots} slots, {total_energy:.1f} kWh")
 
         # Log summary
         log.debug(f"Schedule complete: {len(mandatory_slots)} mandatory + "
@@ -1468,7 +1580,8 @@ def _calculate_and_store_schedule():
 
     except Exception as e:
         log.warning(f"Error calculating schedule: {e}")
-        _update_charging_status(-1, f"Error: {str(e)[:50]}")
+        if update_status:
+            _update_charging_status(-1, f"Error: {str(e)[:50]}")
         return {'success': False, 'message': str(e)}
 
 
@@ -1730,6 +1843,14 @@ def _compute_desired_action(
             return {'type': 'stop', 'status_code': 1, 'status_msg': 'Waiting for scheduled slot'}
         return {'type': 'noop', 'status_code': 1, 'status_msg': 'Waiting for scheduled slot'}
 
+    # Grid sensor unavailable: can't compute a solar surplus. Stop if charging
+    # (fail safe), else do nothing. Scheduled-slot charging (handled above) is
+    # unaffected — it never consults the surplus.
+    if surplus_watts is None:
+        if is_charging:
+            return {'type': 'stop', 'status_code': 0, 'status_msg': 'Grid sensor unavailable'}
+        return {'type': 'noop', 'status_code': 0, 'status_msg': 'Grid sensor unavailable'}
+
     # Pure solar sustain: keep charging as long as surplus covers 5A minimum
     if is_charging and surplus_watts >= MIN_CHARGE_POWER_W:
         target_amps = _calculate_target_amps_from_power(surplus_watts)
@@ -1791,10 +1912,15 @@ def _get_effective_surplus(is_charging, grid_power_instant, grid_power_avg, tesl
         tesla_power_w: Current Tesla charger draw in W (already converted from kW).
 
     Returns:
-        float: Effective surplus in watts.
+        float: Effective surplus in watts, or None if the needed grid sensor is
+        unavailable (instant when charging, 15-min avg otherwise).
     """
     if is_charging:
+        if grid_power_instant is None:
+            return None
         return grid_power_instant + tesla_power_w
+    if grid_power_avg is None:
+        return None
     return grid_power_avg
 
 
@@ -1825,6 +1951,11 @@ def _update_solar_availability_indicator(is_charging, is_daylight, grid_power_av
         input_select.select_option(entity_id=OUTPUT_SOLAR_AVAILABLE, option='off')
         return
 
+    if grid_power_avg is None:
+        # Grid sensor unavailable -> can't assess solar availability.
+        input_select.select_option(entity_id=OUTPUT_SOLAR_AVAILABLE, option='off')
+        return
+
     if is_charging:
         available = grid_power_avg + tesla_power_w
     else:
@@ -1844,6 +1975,66 @@ def _update_solar_availability_indicator(is_charging, is_daylight, grid_power_av
         return
 
     input_select.select_option(entity_id=OUTPUT_SOLAR_AVAILABLE, option='off')
+
+
+def _gather_controller_inputs():
+    """Gather the shared per-tick controller inputs in one place.
+
+    Reads live state once and returns a dict consumed by the controller and the
+    diagnostic test service. Grid reads are unavailable-aware: an unavailable /
+    unknown / unparseable grid sensor yields None (not a coerced 0, which would
+    look like "no surplus" and mask a sensor outage). The Tesla charger-power
+    read keeps its 0.0 fallback (a dead read while not charging is benign).
+    Prices are fetched only during daylight (the scheduled-slot path never needs
+    them).
+
+    Returns:
+        dict with keys: is_charging, is_daylight, grid_power_instant,
+        grid_power_avg, tesla_power_w, buy_price, sell_price.
+    """
+    is_charging = _is_currently_charging()
+    is_daylight = _is_during_daylight()
+
+    raw = state.get(GRID_POWER_CURRENT)
+    if raw in (None, 'unavailable', 'unknown'):
+        log.warning(f"Grid power sensor unavailable: {raw}")
+        grid_power_instant = None
+    else:
+        try:
+            grid_power_instant = float(raw)
+        except (ValueError, TypeError):
+            log.warning(f"Grid power sensor unavailable: {raw}")
+            grid_power_instant = None
+
+    raw_avg = state.get(GRID_POWER_15MIN_AVG)
+    if raw_avg in (None, 'unavailable', 'unknown'):
+        log.warning(f"Grid power sensor unavailable: {raw_avg}")
+        grid_power_avg = None
+    else:
+        try:
+            grid_power_avg = float(raw_avg)
+        except (ValueError, TypeError):
+            log.warning(f"Grid power sensor unavailable: {raw_avg}")
+            grid_power_avg = None
+
+    try:
+        tesla_power_w = float(state.get(TESLA_CHARGER_POWER) or 0) * 1000
+    except (ValueError, TypeError):
+        tesla_power_w = 0.0
+
+    buy_price, sell_price = (None, None)
+    if is_daylight:
+        buy_price, sell_price = _get_current_prices()
+
+    return {
+        'is_charging': is_charging,
+        'is_daylight': is_daylight,
+        'grid_power_instant': grid_power_instant,
+        'grid_power_avg': grid_power_avg,
+        'tesla_power_w': tesla_power_w,
+        'buy_price': buy_price,
+        'sell_price': sell_price,
+    }
 
 
 # =============================================================================
@@ -1904,6 +2095,10 @@ def tesla_charging_control():
     State-based: every tick re-derives desired action from current conditions.
     No history / ownership flags. Manual override = toggle smart charging off.
     """
+    # Serialize overlapping ticks (cron + state-trigger immediate calls) so a
+    # slow charge command can't race a second entry.
+    task.unique("tesla_charging_control")
+
     if not _is_smart_charging_enabled():
         input_select.select_option(entity_id=OUTPUT_SOLAR_AVAILABLE, option='off')
         return
@@ -1913,39 +2108,27 @@ def tesla_charging_control():
     # daytime solar top-ups shrink the night schedule so we don't overcharge.
     # Cheap and read-only w.r.t. the car (SOC comes from a state sensor, no wake).
     # Runs regardless of car location, matching on-enable and the daily 15:00 calc.
-    _calculate_and_store_schedule()
+    # update_status=False: suppress the schedule-calc status writes so the
+    # controller's own final _update_charging_status is the only status write
+    # this tick (prevents the 2->1->2 flap).
+    _calculate_and_store_schedule(update_status=False)
 
-    is_charging = _is_currently_charging()
-
-    # Decision-input gather block — kept in sync with teslaSmartChargingTestService
-    # (the diagnostic service mirrors this to log what the controller would decide).
-    #
-    # Gather shared state once per tick — passed into helpers to avoid redundant reads.
-    # is_daylight is cheap; grid and tesla power are single lookups; prices are only
-    # fetched when daylight (the scheduled-slot path below never needs them).
+    # Gather shared per-tick state once — see _gather_controller_inputs.
+    # Grid reads are unavailable-aware (None on outage, not coerced 0).
     #
     # Surplus model (intentional asymmetry):
     #   - Controller uses instantaneous grid + Tesla draw when ALREADY charging
     #     (real-time, no averaging lag). Uses 15-min avg otherwise (stable).
     #   - Indicator always uses 15-min avg + Tesla draw (represents the
     #     "would solar start if plugged in now?" question — a start decision).
-    is_daylight = _is_during_daylight()
-    try:
-        grid_power_instant = float(state.get(GRID_POWER_CURRENT) or 0)
-    except (ValueError, TypeError):
-        grid_power_instant = 0.0
-    try:
-        grid_power_avg = float(state.get(GRID_POWER_15MIN_AVG) or 0)
-    except (ValueError, TypeError):
-        grid_power_avg = 0.0
-    try:
-        tesla_power_w = float(state.get(TESLA_CHARGER_POWER) or 0) * 1000
-    except (ValueError, TypeError):
-        tesla_power_w = 0.0
-
-    buy_price, sell_price = (None, None)
-    if is_daylight:
-        buy_price, sell_price = _get_current_prices()
+    inputs = _gather_controller_inputs()
+    is_charging = inputs['is_charging']
+    is_daylight = inputs['is_daylight']
+    grid_power_instant = inputs['grid_power_instant']
+    grid_power_avg = inputs['grid_power_avg']
+    tesla_power_w = inputs['tesla_power_w']
+    buy_price = inputs['buy_price']
+    sell_price = inputs['sell_price']
 
     _update_solar_availability_indicator(
         is_charging=is_charging,
@@ -2029,14 +2212,8 @@ def on_smart_charging_enabled():
     # Brief delay to ensure state is stable
     task.sleep(2)
 
-    result = _calculate_and_store_schedule()
-
-    if result['success']:
-        log.info(f"Schedule calculated on enable: {result['message']}")
-    else:
-        log.warning(f"Schedule calculation on enable failed: {result['message']}")
-
-    # Immediately evaluate current conditions via unified controller
+    # The controller recalculates the schedule itself (update_status=False) and
+    # then writes the single authoritative status for this tick.
     tesla_charging_control()
 
 
@@ -2056,14 +2233,8 @@ def on_car_arrives_home():
 
     task.sleep(60)
 
-    result = _calculate_and_store_schedule()
-
-    if result['success']:
-        log.info(f"Schedule calculated on arrival: {result['message']}")
-    else:
-        log.warning(f"Schedule calculation on arrival failed: {result['message']}")
-
-    # Immediately evaluate current conditions via unified controller
+    # The controller recalculates the schedule itself (update_status=False) and
+    # then writes the single authoritative status for this tick.
     tesla_charging_control()
 
 
@@ -2089,18 +2260,9 @@ def on_cable_connected():
         log.debug("Car not at home")
         return
 
-    # Calculate schedule (with exception safety)
-    log.info("Calculating charging schedule after cable connection")
-    try:
-        result = _calculate_and_store_schedule()
-        if result['success']:
-            log.info(f"Schedule calculated: {result['message']}")
-        else:
-            log.warning(f"Schedule calculation failed: {result['message']}")
-    except Exception as e:
-        log.error(f"Exception during schedule calculation: {e}")
-
-    # Immediately evaluate current conditions via unified controller
+    # The controller recalculates the schedule itself (update_status=False) and
+    # then writes the single authoritative status for this tick.
+    log.info("Evaluating charging conditions after cable connection")
     tesla_charging_control()
 
 
@@ -2240,42 +2402,27 @@ def teslaSmartChargingTestService(action=None, id=None):
     try:
         log.info("Testing unified controller decision logic...")
 
-        # Mirror of tesla_charging_control's gather block — keep in sync.
-        # Gather live state for a sample decision
+        # Gather live state for a sample decision via the shared helper.
         schedule_now = _get_stored_schedule()
         is_in_slot_now = False
         if schedule_now:
             is_in_slot_now, _ = _is_current_time_in_scheduled_slot(schedule_now)
-        is_charging_now = _is_currently_charging()
-        is_daylight_now = _is_during_daylight()
-        try:
-            grid_power_instant_test = float(state.get(GRID_POWER_CURRENT) or 0)
-        except (ValueError, TypeError):
-            grid_power_instant_test = 0.0
-        try:
-            grid_power_avg_test = float(state.get(GRID_POWER_15MIN_AVG) or 0)
-        except (ValueError, TypeError):
-            grid_power_avg_test = 0.0
-        try:
-            tesla_power_w_test = float(state.get(TESLA_CHARGER_POWER) or 0) * 1000
-        except (ValueError, TypeError):
-            tesla_power_w_test = 0.0
+        inputs = _gather_controller_inputs()
         surplus_now = _get_effective_surplus(
-            is_charging_now,
-            grid_power_instant_test,
-            grid_power_avg_test,
-            tesla_power_w_test,
+            inputs['is_charging'],
+            inputs['grid_power_instant'],
+            inputs['grid_power_avg'],
+            inputs['tesla_power_w'],
         )
-        buy_now, sell_now = _get_current_prices() if is_daylight_now else (None, None)
 
         action = _compute_desired_action(
             is_in_slot=is_in_slot_now,
-            is_charging=is_charging_now,
-            is_daylight=is_daylight_now,
+            is_charging=inputs['is_charging'],
+            is_daylight=inputs['is_daylight'],
             surplus_watts=surplus_now,
-            buy_price=buy_now,
-            sell_price=sell_now,
-            price_threshold=_get_blended_price_threshold() if is_daylight_now else None,
+            buy_price=inputs['buy_price'],
+            sell_price=inputs['sell_price'],
+            price_threshold=_get_blended_price_threshold() if inputs['is_daylight'] else None,
         )
         log.info(f"Current decision: {action}")
     except Exception as e:

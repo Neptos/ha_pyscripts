@@ -71,11 +71,11 @@ Creates electricity cost indicators (0-3 scale) based on short-term (today+tomor
 - Plus detailed price statistics as attributes
 
 **Logic**:
-- Normalizes raw_today/raw_tomorrow data to handle mixed hourly/15-min formats (lines 123, 133)
+- Normalizes raw_today/raw_tomorrow data to handle mixed hourly/15-min formats
 - Splits hourly entries (>45 min duration) into four 15-min intervals with equal prices
 - Cost indicator: 0=cheap, 3=expensive
-- Short-term component (0-2): Based on position vs 25th percentile, average of today+tomorrow
-- Long-term component (+0 or +1): Based on position vs 10-day average
+- Short-term component (0-2): Based on position vs the midpoint between average and minimum (labelled 25_percent), average of today+tomorrow
+- Long-term component (+0 or +1): Based on position vs the 10-day historical hourly average
 
 ## Development Notes
 
@@ -109,31 +109,3 @@ Optimizes Tesla charging based on Nordpool spot prices and solar production fore
 - `avg_price_c_kwh` - Energy-weighted average effective price (c/kWh)
 - `estimated_cost_eur` - Total estimated cost in EUR
 - `slot_count`, `solar_slots_count`, `mode`, `next_slot_start`, `schedule_end`
-
-## Automations
-
-YAML automations in `automations/` are loaded by HA via `automation: !include_dir_list automations/` in `configuration.yaml`. Each file contains a single automation (not wrapped in a list).
-
-### Doorbell Camera Notifications
-
-Sends temporary, rate-limited phone notifications from a UniFi Protect G4 Doorbell Pro PoE camera. Enable the toggle when expecting guests; it auto-disables after 2 hours.
-
-**Files**:
-- `automations/doorbell_notifications.yaml` - Detection notification automation
-- `automations/doorbell_notifications_auto_disable.yaml` - 2-hour auto-disable with restart resilience
-
-**Required Helpers** (create in HA UI before deploying):
-- `input_boolean.doorbell_notifications_enabled` - Master toggle (default: off)
-- `input_select.doorbell_notification_target` - Phone selector; options must be `mobile_app_<phone_name>` (the suffix of `notify.mobile_app_*` services — check Developer Tools → Services)
-- `timer.doorbell_notification_cooldown` - Rate limit timer (duration: `00:10:00`)
-- `timer.doorbell_notifications_auto_disable` - Auto-disable timer (duration: `02:00:00`)
-- **Important**: Enable "Restore state and time" on both timers. If the UI checkbox doesn't persist (known bug), configure via `configuration.yaml` instead: `timer: {doorbell_notification_cooldown: {duration: "00:10:00", restore: true}, doorbell_notifications_auto_disable: {duration: "02:00:00", restore: true}}`
-
-**Detection Sensors** (UniFi Protect G4 Doorbell Pro PoE):
-- `binary_sensor.g4_doorbell_pro_poe_person_detected`
-- `binary_sensor.g4_doorbell_pro_poe_vehicle_detected`
-- `binary_sensor.g4_doorbell_pro_poe_animal_detected`
-- `binary_sensor.g4_doorbell_pro_poe_package_detected`
-- `binary_sensor.g4_doorbell_pro_poe_doorbell`
-
-**Camera snapshot**: `camera.g4_doorbell_pro_poe_high` — verify entity ID in Developer Tools → States before deploying.

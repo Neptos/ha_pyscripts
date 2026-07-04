@@ -25,16 +25,28 @@ def _normalize_price_data(price_dictionaries):
 
     Handles mixed format where some entries may span a full hour (due to timezone
     differences) by splitting hourly entries into 4 equal 15-minute prices.
+
+    Entries missing start/end/value, or whose start/end cannot be parsed, are
+    dropped with a warning. Output entries always carry datetime start/end; the
+    value passes through untouched.
+
+    Canonical shared helper: this function's source text is kept byte-identical
+    across the deployed scripts and is enforced by tests/test_shared_helper_drift.py.
     """
     normalized = []
 
     for entry in price_dictionaries:
         if 'start' not in entry or 'end' not in entry or 'value' not in entry:
+            log.warning(f"Skipping malformed price entry: {entry}")
             continue
 
-        start = _parse_dt(entry['start'])
-        end = _parse_dt(entry['end'])
-        duration_minutes = (end - start).total_seconds() / 60
+        try:
+            start = _parse_dt(entry['start'])
+            end = _parse_dt(entry['end'])
+            duration_minutes = (end - start).total_seconds() / 60
+        except (ValueError, TypeError, AttributeError):
+            log.warning(f"Skipping malformed price entry: {entry}")
+            continue
 
         if duration_minutes > 45:
             for i in range(4):
@@ -174,7 +186,7 @@ def _evaluate_morning_guarantee(bt7, cheap_slots, pool):
         for i in range(4):
             iv_start = hour_slot['hour_start'] + timedelta(minutes=15 * i)
             iv_end = hour_slot['hour_start'] + timedelta(minutes=15 * (i + 1))
-            if iv_start >= now:
+            if iv_end > now:
                 overnight_intervals.append({
                     'start': iv_start,
                     'end': iv_end,
@@ -463,14 +475,14 @@ def updateHotWaterHeatingStatus():
     else:
         last_change = attrs.get('last_decision_change', now.isoformat()) if attrs else now.isoformat()
 
-    # Write status
-    input_number.hot_water_heating_status = status
-
-    # Write fixed attributes
-    input_number.hot_water_heating_status.reason = reason
-    input_number.hot_water_heating_status.last_calculated = now.isoformat()
-    input_number.hot_water_heating_status.last_decision_change = last_change
-
-    # Write debug attributes
-    for key, value in debug.items():
-        state.setattr(f'input_number.hot_water_heating_status.{key}', value)
+    # Write status value + all attributes in one merge call. state.set(name,
+    # value, **kwargs) sets the value and MERGES the kwargs into the existing
+    # attributes (pyscript semantics), so other attributes on the entity are
+    # preserved (never new_attributes= full-replace).
+    attrs = {
+        'reason': reason,
+        'last_calculated': now.isoformat(),
+        'last_decision_change': last_change,
+        **debug,
+    }
+    state.set('input_number.hot_water_heating_status', status, **attrs)
