@@ -53,8 +53,9 @@ def _delta_from_history(rows):
     """Return last - first of numeric history states, ignoring unavailable/unknown.
 
     Filters out rows whose state is 'unavailable'/'unknown' or non-float-parseable.
-    Returns 0.0 when fewer than 2 valid points remain, logging a warning so an hour
-    of missing sensor data leaves a diagnostic trail (no sensor id available here).
+    Returns 0.0 when fewer than 2 valid points remain. Warns only when 2+ rows
+    were present but got filtered out as invalid (a genuine data-quality issue);
+    an idle sensor that produced 0-1 rows this hour is normal and stays silent.
     """
     valid = []
     for row in rows:
@@ -65,7 +66,8 @@ def _delta_from_history(rows):
         except (ValueError, TypeError):
             continue
     if len(valid) < 2:
-        log.warning("History delta has fewer than 2 valid points, using 0.0 delta")
+        if len(rows) >= 2:
+            log.warning("History delta has fewer than 2 valid points, using 0.0 delta")
         return 0.0
     return valid[-1] - valid[0]
 

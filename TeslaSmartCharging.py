@@ -836,10 +836,16 @@ def _build_slot_list_with_effective_prices(now=None, nordpool_attrs=None, sell_a
         # Current time for filtering past slots
         if now is None:
             now = datetime.now().astimezone()
+        solar_ctx = None
         if effective_price_fn is None:
             # Hoist the per-build solar invariants out of the slot loop: read
             # sunrise/sunset, now, and the two forecast sensors ONCE (all are
             # constant within a single build) and thread them through as ctx.
+            # NOTE: deliberately NOT wrapped in a lambda — pyscript's AST
+            # interpreter fails to resolve a lambda's closure over enclosing
+            # function locals at call time (NameError on 'solar_ctx' in HA,
+            # 2026-07-04), so the loop below calls _calculate_effective_price
+            # directly with solar_ctx when no custom fn is provided.
             sunrise, sunset = _get_sunrise_sunset()
             solar_ctx = {
                 'sunrise': sunrise,
@@ -848,7 +854,6 @@ def _build_slot_list_with_effective_prices(now=None, nordpool_attrs=None, sell_a
                 'today_kwh': state.get(SOLAR_REMAINING_TODAY),
                 'tomorrow_kwh': state.get(SOLAR_PRODUCTION_TOMORROW),
             }
-            effective_price_fn = lambda s, b, sp: _calculate_effective_price(s, b, sp, solar_ctx=solar_ctx)
 
         # Build slot list
         max_slot_energy = MAX_CHARGE_RATE_KW * SLOT_DURATION_HOURS
@@ -900,9 +905,14 @@ def _build_slot_list_with_effective_prices(now=None, nordpool_attrs=None, sell_a
                         sell_price = buy_price * 0.5
 
                 # Calculate effective price with solar
-                effective_price, solar_energy, grid_energy = effective_price_fn(
-                    start, buy_price, sell_price
-                )
+                if effective_price_fn is not None:
+                    effective_price, solar_energy, grid_energy = effective_price_fn(
+                        start, buy_price, sell_price
+                    )
+                else:
+                    effective_price, solar_energy, grid_energy = _calculate_effective_price(
+                        start, buy_price, sell_price, solar_ctx=solar_ctx
+                    )
 
                 slots.append({
                     'start': start,

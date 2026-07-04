@@ -248,6 +248,16 @@ def test_delta_from_history_fewer_than_two_valid_returns_zero(savings):
     assert savings._delta_from_history(rows) == 0.0
 
 
+def test_delta_from_history_idle_single_row_stays_silent(savings, world):
+    """An idle sensor yielding 0-1 rows this hour is normal — no warning spam."""
+    w = world(savings)
+    assert savings._delta_from_history([_hist_row(BASE, 100.0)]) == 0.0
+    assert savings._delta_from_history([]) == 0.0
+    assert not any(
+        "fewer than 2 valid points" in msg for _level, msg in w.log.records
+    )
+
+
 def test_delta_from_history_warns_when_fewer_than_two_valid(savings, world):
     """M8: a whole hour of unavailable data must leave a diagnostic warning."""
     w = world(savings)
