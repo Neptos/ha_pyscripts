@@ -92,6 +92,29 @@ def test_price_ceiling_keeps_cheap_optional_below_ceiling(tesla):
     assert len(kept) == 4
 
 
+def test_price_ceiling_drops_all_when_every_optional_above_ceiling(tesla):
+    """Optional-only schedule (car above 50%) with every price above the ceiling.
+
+    With no mandatory slots and uniform expensive prices, the most expensive
+    remaining slot always equals the running average, so a break condition
+    comparing against max(avg, ceiling) exits immediately and keeps the whole
+    expensive schedule (2026-07-12 production regression). The candidate must
+    be compared against the CEILING alone: above-ceiling slots never survive
+    while the average exceeds the ceiling.
+    """
+    slot_energy = tesla.MAX_CHARGE_RATE_KW * tesla.SLOT_DURATION_HOURS
+    start = _tz_start()
+    ceiling = 8.0
+
+    # Uniform: all optional at 25 c/kWh, no mandatory.
+    optional = _mk_slots(8, [25.0] * 8, start, slot_energy)
+    assert tesla._apply_price_ceiling([], optional, ceiling) == []
+
+    # Near-uniform: cheapest (24) is below the initial avg but still 3x the ceiling.
+    optional = _mk_slots(4, [24.0, 25.0, 26.0, 25.5], start, slot_energy)
+    assert tesla._apply_price_ceiling([], optional, ceiling) == []
+
+
 def test_price_ceiling_empty_optional(tesla):
     slot_energy = tesla.MAX_CHARGE_RATE_KW * tesla.SLOT_DURATION_HOURS
     mandatory = _mk_slots(2, [2.0, 2.0], _tz_start(), slot_energy)

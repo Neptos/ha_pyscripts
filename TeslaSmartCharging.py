@@ -1158,10 +1158,14 @@ def _apply_price_ceiling(mandatory_slots, optional_slots, max_avg_price):
         avg = total_cost / total_energy if total_energy > 0 else 0.0
         if avg <= max_avg_price:
             break
-        # Never drop a slot that is at/below the current average or the ceiling:
-        # dropping such a slot would only raise the average, and a slot priced
-        # within budget is wanted.
-        if optional[0]['effective_price'] <= max(avg, max_avg_price):
+        # Never drop a slot priced at/below the CEILING: it is within budget
+        # and dropping it can only raise the average (all remaining slots are
+        # cheaper). Above-ceiling slots keep dropping even when that cannot
+        # bring the average under the ceiling — comparing against the running
+        # average here instead kept whole uniformly-expensive optional-only
+        # schedules (no mandatory slots -> most expensive == avg on the first
+        # iteration; 2026-07-12 production regression).
+        if optional[0]['effective_price'] <= max_avg_price:
             break
         dropped = optional.pop(0)  # Drop most expensive
         log.debug(f"Price ceiling: dropped slot at {dropped['start'].strftime('%H:%M')} "
