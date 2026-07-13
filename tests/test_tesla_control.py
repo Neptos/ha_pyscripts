@@ -168,6 +168,87 @@ def test_effective_surplus_none_when_grid_unavailable(tesla):
     assert tesla._get_effective_surplus(False, 1000, None, 300) is None
 
 
+def test_solar_only_ignores_scheduled_slot(tesla):
+    """Solar-only mode: in-slot at night -> wait for daylight, not scheduled charge."""
+    action = tesla._compute_desired_action(
+        is_in_slot=True,
+        is_charging=False,
+        is_daylight=False,
+        surplus_watts=0,
+        buy_price=5,
+        sell_price=2,
+        price_threshold=None,
+        solar_only=True,
+    )
+    assert action['type'] == 'noop'
+    assert action['status_code'] == 1
+    assert action['status_msg'] == 'Solar-only: waiting for daylight'
+
+
+def test_solar_only_stops_charging_in_slot_at_night(tesla):
+    """Solar-only mode: charging in a scheduled slot at night -> stop."""
+    action = tesla._compute_desired_action(
+        is_in_slot=True,
+        is_charging=True,
+        is_daylight=False,
+        surplus_watts=0,
+        buy_price=5,
+        sell_price=2,
+        price_threshold=None,
+        solar_only=True,
+    )
+    assert action['type'] == 'stop'
+    assert action['status_msg'] == 'Solar-only: waiting for daylight'
+
+
+def test_solar_only_allows_pure_solar(tesla):
+    """Solar-only mode: pure solar tiers still charge; in-slot doesn't preempt."""
+    surplus = tesla.SOLAR_START_THRESHOLD_W + 100
+    action = tesla._compute_desired_action(
+        is_in_slot=True,
+        is_charging=False,
+        is_daylight=True,
+        surplus_watts=surplus,
+        buy_price=5,
+        sell_price=2,
+        price_threshold=None,
+        solar_only=True,
+    )
+    assert action['type'] == 'charge'
+    assert action['status_code'] == 3
+    assert action['amps'] == tesla._calculate_target_amps_from_power(surplus)
+
+
+def test_solar_only_disables_blended(tesla):
+    """Solar-only mode: blended conditions met (cheap price) -> still no charge."""
+    surplus = tesla.SOLAR_BLENDED_MIN_W + 100
+    effective = tesla._calculate_blended_effective_price(surplus, 10, 2)
+    action = tesla._compute_desired_action(
+        is_in_slot=False,
+        is_charging=False,
+        is_daylight=True,
+        surplus_watts=surplus,
+        buy_price=10,
+        sell_price=2,
+        price_threshold=effective + 1,
+        solar_only=True,
+    )
+    assert action['type'] == 'noop'
+    assert action['status_code'] == 0
+
+
+def test_is_solar_only_mode_reads_helper(tesla, world):
+    """_is_solar_only_mode: 'on' -> True; unavailable/missing -> False (normal mode)."""
+    world(tesla, get={tesla.OUTPUT_SOLAR_ONLY_MODE: "on"})
+    assert tesla._is_solar_only_mode() is True
+
+    world(tesla, get={tesla.OUTPUT_SOLAR_ONLY_MODE: "unavailable"})
+    assert tesla._is_solar_only_mode() is False
+
+    world(tesla, get={})
+    assert tesla._is_solar_only_mode() is False
+
+
 def test_gather_controller_inputs_grid_unavailable(tesla, world):
     """_gather_controller_inputs: 'unavailable' grid -> None + warning logged."""
     get = {

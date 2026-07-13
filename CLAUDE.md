@@ -96,6 +96,7 @@ Optimizes Tesla charging based on Nordpool spot prices and solar production fore
 - `input_boolean.tesla_smart_charging_enabled` - Master on/off toggle
 - `input_number.tesla_max_avg_price` - Price ceiling for average charging cost (c/kWh, 0-30, step 0.5). Set to 0 to disable. Only affects optional (Pass 2) slots — mandatory 50% guarantee always completes.
 - `input_select.tesla_solar_charging_available` - Solar charging availability indicator. Options: `off`, `blended`, `pure`. Updated every 15 minutes during daylight. Reflects what would happen if the car were plugged in now (adds back Tesla draw if already charging).
+- `input_boolean.tesla_solar_only_mode` - Solar-only mode toggle. When on, the schedule is still calculated and displayed but not executed; the car charges only from pure solar surplus (scheduled slots and blended tier are ignored, so the 50% morning guarantee is display-only). Missing/unavailable helper is treated as off (normal mode).
 
 **Key Features**:
 - Two-pass greedy algorithm: Pass 1 (mandatory) ensures 50% SOC by 7:00 AM, Pass 2 (optional) fills to charge limit

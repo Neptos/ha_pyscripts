@@ -46,6 +46,13 @@ Create these helpers in Home Assistant BEFORE deploying this script:
      during daylight. Reflects what would happen if the car were
      plugged in now (adds back Tesla draw if already charging).
 
+6. input_boolean.tesla_solar_only_mode
+   - Solar-only mode toggle. When on, the schedule is still calculated
+     and displayed but NOT executed; the car charges only from pure
+     solar surplus (scheduled slots and blended tier are ignored).
+   - The 50% morning guarantee is display-only in this mode.
+   - Missing/unavailable helper is treated as off (normal mode).
+
 ================================================================================
 KEY FEATURES
 ================================================================================
@@ -67,6 +74,8 @@ KEY FEATURES
      when surplus falls below MIN_CHARGE_POWER_W (3450W)
    - Blended tier: partial solar + grid at MIN_CHARGE_AMPS when price is cheap
    - Solar availability indicator updated each tick before car-specific gates
+   - Solar-only mode (input_boolean.tesla_solar_only_mode): schedule is
+     calculated for display only; scheduled-slot and blended tiers are skipped
    - Manual override: toggle input_boolean.tesla_smart_charging_enabled off
 
 3. AUTOMATIC REPLANNING
@@ -95,6 +104,7 @@ Time Triggers:
 
 State Triggers:
   - input_boolean.tesla_smart_charging_enabled == 'on': calculate schedule + immediate control
+  - input_boolean.tesla_solar_only_mode on/off: immediate control tick
   - device_tracker.location == 'home': calculate schedule on arrival
   - binary_sensor.charge_cable == 'on': calculate schedule + immediate control
 
@@ -213,6 +223,7 @@ SUN_NEXT_SETTING = "sensor.sun_next_setting"
 # --- Output Entities (create as HA helpers) ---
 OUTPUT_CHARGING_STATUS = "input_number.tesla_charging_status"
 OUTPUT_SMART_CHARGING_ENABLED = "input_boolean.tesla_smart_charging_enabled"
+OUTPUT_SOLAR_ONLY_MODE = "input_boolean.tesla_solar_only_mode"
 OUTPUT_MAX_AVG_PRICE = "input_number.tesla_max_avg_price"
 OUTPUT_SOLAR_AVAILABLE = "input_select.tesla_solar_charging_available"
 
@@ -369,6 +380,25 @@ def _is_smart_charging_enabled():
         return enabled == "on" or enabled == True
     except Exception as e:
         log.warning(f"Error checking smart charging enabled state: {e}")
+        return False
+
+
+def _is_solar_only_mode():
+    """Check if solar-only mode is enabled by the user.
+
+    When on, the schedule is still calculated and stored for display, but the
+    controller ignores scheduled slots and the blended tier — only pure solar
+    surplus charges the car. Unavailable/unknown helper means normal mode.
+
+    Returns:
+        bool: True if solar-only mode is on, False otherwise (including
+        when the helper is missing or unavailable)
+    """
+    try:
+        mode = state.get(OUTPUT_SOLAR_ONLY_MODE)
+        return mode == "on" or mode == True
+    except Exception as e:
+        log.warning(f"Error checking solar-only mode state: {e}")
         return False
 
 
@@ -1822,6 +1852,7 @@ def _compute_desired_action(
     buy_price,
     sell_price,
     price_threshold=None,
+    solar_only=False,
 ):
     """Determine desired charging action from current conditions.
 
@@ -1831,19 +1862,21 @@ def _compute_desired_action(
         {'type': 'noop', 'status_code': int, 'status_msg': str}
 
     Decision precedence:
-      1. In scheduled slot -> charge at MAX_CHARGE_AMPS
+      1. In scheduled slot -> charge at MAX_CHARGE_AMPS (skipped in solar-only mode)
       2. Outside daylight -> stop or wait
       3. Pure solar sustain (already charging, surplus >= MIN_CHARGE_POWER_W)
       4. Pure solar start (not charging, surplus >= SOLAR_START_THRESHOLD_W)
-      5. Blended (surplus >= SOLAR_BLENDED_MIN_W and effective_price < price_threshold) -> MIN_CHARGE_AMPS
+      5. Blended (surplus >= SOLAR_BLENDED_MIN_W and effective_price < price_threshold) -> MIN_CHARGE_AMPS (skipped in solar-only mode)
       6. Else -> stop or noop
 
     Pure function: all inputs passed as arguments, no state reads.
     `price_threshold` (c/kWh) is the cutoff for blended-tier selection;
     when None, blended tier is never chosen.
+    `solar_only` disables the scheduled-slot and blended tiers so only
+    pure solar surplus can charge the car.
     """
-    # Scheduled slot: max amps, preempts solar
-    if is_in_slot:
+    # Scheduled slot: max amps, preempts solar (ignored in solar-only mode)
+    if is_in_slot and not solar_only:
         return {
             'type': 'charge',
             'amps': MAX_CHARGE_AMPS,
@@ -1853,9 +1886,10 @@ def _compute_desired_action(
 
     # Outside scheduled slot, outside daylight: stop or wait
     if not is_daylight:
+        wait_msg = 'Solar-only: waiting for daylight' if solar_only else 'Waiting for scheduled slot'
         if is_charging:
-            return {'type': 'stop', 'status_code': 1, 'status_msg': 'Waiting for scheduled slot'}
-        return {'type': 'noop', 'status_code': 1, 'status_msg': 'Waiting for scheduled slot'}
+            return {'type': 'stop', 'status_code': 1, 'status_msg': wait_msg}
+        return {'type': 'noop', 'status_code': 1, 'status_msg': wait_msg}
 
     # Grid sensor unavailable: can't compute a solar surplus. Stop if charging
     # (fail safe), else do nothing. Scheduled-slot charging (handled above) is
@@ -1886,7 +1920,8 @@ def _compute_desired_action(
         }
 
     # Blended: partial solar + grid, only if price is attractive
-    if surplus_watts >= SOLAR_BLENDED_MIN_W and buy_price is not None:
+    # (skipped in solar-only mode — no grid contribution allowed)
+    if not solar_only and surplus_watts >= SOLAR_BLENDED_MIN_W and buy_price is not None:
         effective_price = _calculate_blended_effective_price(
             surplus_watts, buy_price, sell_price or 0
         )
@@ -2177,6 +2212,7 @@ def tesla_charging_control():
     surplus_watts = _get_effective_surplus(is_charging, grid_power_instant,
                                            grid_power_avg, tesla_power_w)
 
+    solar_only = _is_solar_only_mode()
     price_threshold = _get_blended_price_threshold() if is_daylight else None
     action = _compute_desired_action(
         is_in_slot=is_in_slot,
@@ -2186,12 +2222,14 @@ def tesla_charging_control():
         buy_price=buy_price,
         sell_price=sell_price,
         price_threshold=price_threshold,
+        solar_only=solar_only,
     )
 
     if action['type'] == 'charge':
         status_code = action['status_code']
         # Refine scheduled-slot status based on solar content of current slot
-        if is_in_slot and current_slot:
+        # (not in solar-only mode, where the slot didn't cause the charge)
+        if is_in_slot and current_slot and not solar_only:
             solar_energy = current_slot.get('solar_energy', 0)
             status_code = 3 if solar_energy > SOLAR_STATUS_DISPLAY_THRESHOLD_KWH else 2
 
@@ -2222,6 +2260,28 @@ def on_smart_charging_enabled():
     have to wait until the next scheduled calculation (15:00).
     """
     log.info("Smart charging enabled - calculating schedule")
+
+    # Brief delay to ensure state is stable
+    task.sleep(2)
+
+    # The controller recalculates the schedule itself (update_status=False) and
+    # then writes the single authoritative status for this tick.
+    tesla_charging_control()
+
+
+@state_trigger(f"{OUTPUT_SOLAR_ONLY_MODE} == 'on' or {OUTPUT_SOLAR_ONLY_MODE} == 'off'")
+def on_solar_only_mode_changed():
+    """Trigger when solar-only mode is toggled.
+
+    Runs the controller immediately so the mode change takes effect
+    without waiting for the next 15-minute tick (e.g. stopping a
+    scheduled grid charge when solar-only is switched on).
+    """
+    if not _is_smart_charging_enabled():
+        log.debug("Smart charging disabled, skipping solar-only mode handler")
+        return
+
+    log.info("Solar-only mode changed - re-evaluating charging")
 
     # Brief delay to ensure state is stable
     task.sleep(2)
