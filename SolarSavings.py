@@ -240,6 +240,16 @@ def _calculate_heat_pump_cost_with_solar_last_hour(last_hour_buy_price, last_hou
     return (last_hour_buy_price * last_hour_purchased_kwh * heat_pump_share_of_purchase)/100.0
 
 
+def _energy_totals_available(*entity_ids):
+    """True when every cumulative energy sensor currently has a numeric state."""
+    for entity_id in entity_ids:
+        try:
+            float(state.get(entity_id))
+        except (ValueError, TypeError):
+            return False
+    return True
+
+
 @time_trigger("cron(2 * * * *)")
 def calculateSolarSavingsLastHour():
     """Calculate the savings from solar panels during the previous hour"""
@@ -297,12 +307,27 @@ def calculateSolarSavingsLastHour():
                 return
             last_hour_sell_price = float(last_hour_prices[sell_price_entity_id][0]['state'])
 
+    # Grid meter and inverter data gone (Elisa Kotiakku took over the inverter
+    # 2026-10-05; P1 meter reader not yet installed). Without purchased/exported
+    # kWh the solar share is unknown, so claim no solar benefit: cost with solar
+    # equals cost without, overall savings unchanged, heat pump kWh still tracked.
+    last_hour_heat_pump_used_kwh = float(state.get(nibe_energy_used_last_hour_kwh_total_entity_id))
+    last_hour_charged_kwh = _delta_from_history(last_hour_history.get(tesla_wallconnector_energy_entity_id, []))/1000.0
+    if not _energy_totals_available(purchased_kwh_total_entity_id, exported_kwh_total_entity_id, inverter_yield_kwh_total_entity_id):
+        log.info("Grid/inverter energy totals unavailable, booking costs without solar benefit")
+        car_cost = _calculate_car_charge_cost_without_solar_last_hour(last_hour_buy_price, last_hour_charged_kwh)
+        heat_pump_cost = _calculate_heat_pump_cost_without_solar_last_hour(last_hour_buy_price, last_hour_heat_pump_used_kwh)
+        _sum_value_to_sensor(car_cost, car_charge_cost_without_solar_entity_id)
+        _sum_value_to_sensor(car_cost, car_charge_cost_with_solar_entity_id)
+        _sum_value_to_sensor(heat_pump_cost, heat_pump_cost_without_solar_entity_id)
+        _sum_value_to_sensor(heat_pump_cost, heat_pump_cost_with_solar_entity_id)
+        _sum_value_to_sensor(last_hour_heat_pump_used_kwh, heat_pump_consumed_kwh_entity_id)
+        return
+
     # Calculate energy usages last hour
     last_hour_exported_kwh = _delta_from_history(last_hour_history.get(exported_kwh_total_entity_id, []))
     last_hour_produced_kwh = _delta_from_history(last_hour_history.get(inverter_yield_kwh_total_entity_id, []))
     last_hour_purchased_kwh = _delta_from_history(last_hour_history.get(purchased_kwh_total_entity_id, []))
-    last_hour_charged_kwh = _delta_from_history(last_hour_history.get(tesla_wallconnector_energy_entity_id, []))/1000.0
-    last_hour_heat_pump_used_kwh = float(state.get(nibe_energy_used_last_hour_kwh_total_entity_id))
     last_hour_consumed_solar = last_hour_produced_kwh - last_hour_exported_kwh
 
     # Correct for kWh purchased exchange for kWh exported during the hour

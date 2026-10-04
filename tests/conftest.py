@@ -245,7 +245,11 @@ def world(monkeypatch):
 
 @pytest.fixture(scope="session")
 def tesla():
-    return load_pyscript("TeslaSmartCharging.py")
+    mod = load_pyscript("TeslaSmartCharging.py")
+    # Production default is off (Elisa battery takes PV surplus first); the
+    # solar-scheduling tests exercise the forecast path, so enable it here.
+    mod.SOLAR_FORECAST_ENABLED = True
+    return mod
 
 
 @pytest.fixture(scope="session")

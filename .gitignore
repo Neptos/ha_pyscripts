@@ -13,3 +13,6 @@ __pycache__/
 .coverage.*
 htmlcov/
 .pytest_cache/
+
+# secrets
+ha_token

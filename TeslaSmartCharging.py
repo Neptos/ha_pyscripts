@@ -185,6 +185,10 @@ SOLAR_START_THRESHOLD_W = 4500  # Pure solar: surplus covers full minimum charge
 SOLAR_BLENDED_MIN_W = 1500  # Minimum solar surplus for blended solar+grid charging
 
 SOLAR_FORECAST_CONFIDENCE = 0.80  # 80% confidence factor for solar forecasts
+# Elisa-controlled home battery absorbs PV surplus before the car sees it, so
+# forecast-based solar discounts in the schedule would pick daytime slots that
+# then charge from grid at full price. Off until a battery-aware model exists.
+SOLAR_FORECAST_ENABLED = False
 BASELOAD_ESTIMATE_KW = 1.0  # Estimated base load of house (kW)
 
 # --- Location/Availability ---
@@ -642,6 +646,9 @@ def _get_solar_forecast_for_slot(slot_start, ctx=None):
     Returns:
         float: Estimated average solar power in kW for the slot (after baseload)
     """
+    if not SOLAR_FORECAST_ENABLED:
+        return 0.0
+
     try:
         # Check if slot is during daylight hours - no solar outside sunrise/sunset.
         # The sun sensors report the NEXT rising/setting instant, which for a
@@ -1973,6 +1980,31 @@ def _get_effective_surplus(is_charging, grid_power_instant, grid_power_avg, tesl
     return grid_power_avg
 
 
+_GRID_WARNED = {}
+
+
+def _read_grid_power(entity_id):
+    """Grid power in W, or None when the sensor has no numeric state.
+
+    Warns once per entity while it stays unavailable (the control loop runs
+    every 15 minutes and the sensor may be gone for weeks), and logs recovery.
+    """
+    raw = state.get(entity_id)
+    try:
+        if raw in (None, 'unavailable', 'unknown'):
+            raise ValueError(raw)
+        value = float(raw)
+    except (ValueError, TypeError):
+        if not _GRID_WARNED.get(entity_id):
+            log.warning(f"Grid power sensor unavailable ({entity_id}): {raw}")
+            _GRID_WARNED[entity_id] = True
+        return None
+    if _GRID_WARNED.get(entity_id):
+        log.info(f"Grid power sensor {entity_id} available again")
+        _GRID_WARNED[entity_id] = False
+    return value
+
+
 def _update_solar_availability_indicator(is_charging, is_daylight, grid_power_avg,
                                          tesla_power_w, buy_price, sell_price):
     """Update input_select.tesla_solar_charging_available.
@@ -2044,27 +2076,8 @@ def _gather_controller_inputs():
     is_charging = _is_currently_charging()
     is_daylight = _is_during_daylight()
 
-    raw = state.get(GRID_POWER_CURRENT)
-    if raw in (None, 'unavailable', 'unknown'):
-        log.warning(f"Grid power sensor unavailable: {raw}")
-        grid_power_instant = None
-    else:
-        try:
-            grid_power_instant = float(raw)
-        except (ValueError, TypeError):
-            log.warning(f"Grid power sensor unavailable: {raw}")
-            grid_power_instant = None
-
-    raw_avg = state.get(GRID_POWER_15MIN_AVG)
-    if raw_avg in (None, 'unavailable', 'unknown'):
-        log.warning(f"Grid power sensor unavailable: {raw_avg}")
-        grid_power_avg = None
-    else:
-        try:
-            grid_power_avg = float(raw_avg)
-        except (ValueError, TypeError):
-            log.warning(f"Grid power sensor unavailable: {raw_avg}")
-            grid_power_avg = None
+    grid_power_instant = _read_grid_power(GRID_POWER_CURRENT)
+    grid_power_avg = _read_grid_power(GRID_POWER_15MIN_AVG)
 
     try:
         tesla_power_w = float(state.get(TESLA_CHARGER_POWER) or 0) * 1000

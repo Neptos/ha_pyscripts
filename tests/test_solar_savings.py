@@ -307,6 +307,9 @@ def test_calculate_solar_savings_full_flow(savings, world, monkeypatch):
 
     get_map = {
         "sensor.nibe_energy_used_last_hour": "1.5",
+        purchased: "3.0",
+        exported: "1.0",
+        yield_id: "14.0",
         "input_number.solar_savings": "0",
         "input_number.car_charge_without_solar": "0",
         "input_number.car_charge_with_solar": "0",
@@ -389,3 +392,48 @@ def test_fallback_guard_missing_sell_key_warns_and_skips(savings, world, monkeyp
     )
     assert w.state.set_calls == []
     assert any(level == "warning" and "sell price" in msg for level, msg in w.log.records)
+
+
+def test_calculate_solar_savings_totals_unavailable_books_no_solar_benefit(savings, world, monkeypatch):
+    """Grid/inverter totals unavailable (Elisa took the inverter, no P1 yet):
+    cost with solar == cost without solar, overall savings untouched, heat pump
+    kWh still accumulated, and no history-based solar math is attempted."""
+    tesla = "sensor.tesla_wall_connector_energy"
+    history = {tesla: [_hist_row(BASE, 0.0), _hist_row(BASE, 2000.0)]}
+
+    monkeypatch.setattr(savings, "_calculate_weighted_average_price", lambda *a, **k: 10.0)
+    monkeypatch.setattr(savings, "_get_history", lambda *a, **k: history)
+    monkeypatch.setattr(savings, "_net_energy_flows", lambda *a, **k: pytest.fail("solar path must be skipped"))
+
+    get_map = {
+        "sensor.nibe_energy_used_last_hour": "1.5",
+        "sensor.power_meter_consumption": "unavailable",
+        "sensor.power_meter_exported": "unavailable",
+        "sensor.inverter_total_yield": "unavailable",
+        "input_number.solar_savings": "100",
+        "input_number.car_charge_without_solar": "0",
+        "input_number.car_charge_with_solar": "0",
+        "input_number.heat_pump_cost_without_solar": "0",
+        "input_number.heat_pump_cost_with_solar": "0",
+        "input_number.heat_pump_consumed_kwh": "0",
+    }
+    attrs = {k: {"device_class": "monetary"} for k in get_map if k.startswith("input_number.")}
+    w = world(savings, get=get_map, attrs=attrs)
+
+    savings.calculateSolarSavingsLastHour()
+
+    written = dict(w.state.set_calls)
+    assert "input_number.solar_savings" not in written
+    # 2 kWh car at 10 c/kWh = 0.20 EUR; 1.5 kWh heat pump = 0.15 EUR
+    assert written["input_number.car_charge_without_solar"] == pytest.approx(0.20)
+    assert written["input_number.car_charge_with_solar"] == pytest.approx(0.20)
+    assert written["input_number.heat_pump_cost_without_solar"] == pytest.approx(0.15)
+    assert written["input_number.heat_pump_cost_with_solar"] == pytest.approx(0.15)
+    assert written["input_number.heat_pump_consumed_kwh"] == pytest.approx(1.5)
+
+
+def test_energy_totals_available(savings, world):
+    world(savings, get={"sensor.a": "12.5", "sensor.b": "unavailable", "sensor.c": None})
+    assert savings._energy_totals_available("sensor.a")
+    assert not savings._energy_totals_available("sensor.a", "sensor.b")
+    assert not savings._energy_totals_available("sensor.c")

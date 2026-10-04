@@ -185,3 +185,16 @@ def test_m14_outside_curve_hour_equals_buy(tesla, world):
 
         assert solar_e == pytest.approx(0.0)
         assert eff == pytest.approx(buy_price)
+
+
+def test_solar_forecast_disabled_returns_zero(tesla, world, monkeypatch):
+    """Production default: forecast contribution off, every slot prices at buy."""
+    with freeze_time("2026-07-01 15:00:00"):
+        tz = _local_tz()
+        rising = datetime.datetime(2026, 7, 1, 4, 0, 0, tzinfo=tz)
+        setting = datetime.datetime(2026, 7, 1, 22, 0, 0, tzinfo=tz)
+        world(tesla, get=_sun_get(tz, rising, setting, remaining_today=6.0)(tesla))
+        slot = datetime.datetime(2026, 7, 1, 16, 0, 0, tzinfo=tz)
+        assert tesla._get_solar_forecast_for_slot(slot) > 0.0
+        monkeypatch.setattr(tesla, "SOLAR_FORECAST_ENABLED", False)
+        assert tesla._get_solar_forecast_for_slot(slot) == 0.0

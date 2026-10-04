@@ -251,6 +251,7 @@ def test_is_solar_only_mode_reads_helper(tesla, world):
 
 def test_gather_controller_inputs_grid_unavailable(tesla, world):
     """_gather_controller_inputs: 'unavailable' grid -> None + warning logged."""
+    tesla._GRID_WARNED.clear()  # warn-once state persists on the session-scoped module
     get = {
         tesla.GRID_POWER_CURRENT: "unavailable",
         tesla.GRID_POWER_15MIN_AVG: "500",
@@ -264,3 +265,18 @@ def test_gather_controller_inputs_grid_unavailable(tesla, world):
     warnings = [msg for (lvl, msg) in w.log.records
                 if lvl == "warning" and "Grid power sensor unavailable" in str(msg)]
     assert warnings
+
+
+def test_read_grid_power_warns_once_and_recovers(tesla, world):
+    """Unavailable grid sensor -> None with a single warning; numeric -> float
+    and the warned flag clears so the next outage warns again."""
+    tesla._GRID_WARNED.clear()
+    w = world(tesla, get={"sensor.g": "unavailable"})
+    assert tesla._read_grid_power("sensor.g") is None
+    assert tesla._read_grid_power("sensor.g") is None
+    assert tesla._GRID_WARNED["sensor.g"] is True
+    w.state.get_map["sensor.g"] = "-531"
+    assert tesla._read_grid_power("sensor.g") == -531.0
+    assert tesla._GRID_WARNED["sensor.g"] is False
+    w.state.get_map["sensor.g"] = None
+    assert tesla._read_grid_power("sensor.g") is None
