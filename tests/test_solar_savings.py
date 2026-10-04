@@ -437,3 +437,13 @@ def test_energy_totals_available(savings, world):
     assert savings._energy_totals_available("sensor.a")
     assert not savings._energy_totals_available("sensor.a", "sensor.b")
     assert not savings._energy_totals_available("sensor.c")
+
+
+def test_energy_totals_available_missing_entity_raises_nameerror(savings, monkeypatch):
+    """pyscript raises NameError for an entity that does not exist (integration
+    disabled); that must read as unavailable, not crash the hourly run."""
+    class _State:
+        def get(self, entity_id):
+            raise NameError(f"name '{entity_id}' is not defined")
+    monkeypatch.setattr(savings, "state", _State())
+    assert not savings._energy_totals_available("sensor.power_meter_consumption")

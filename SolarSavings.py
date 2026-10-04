@@ -241,11 +241,15 @@ def _calculate_heat_pump_cost_with_solar_last_hour(last_hour_buy_price, last_hou
 
 
 def _energy_totals_available(*entity_ids):
-    """True when every cumulative energy sensor currently has a numeric state."""
+    """True when every cumulative energy sensor currently has a numeric state.
+
+    pyscript's state.get raises NameError for an entity that does not exist
+    at all (e.g. its integration is disabled), so that counts as unavailable.
+    """
     for entity_id in entity_ids:
         try:
             float(state.get(entity_id))
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, NameError):
             return False
     return True
 

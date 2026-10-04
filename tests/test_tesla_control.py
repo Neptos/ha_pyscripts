@@ -280,3 +280,22 @@ def test_read_grid_power_warns_once_and_recovers(tesla, world):
     assert tesla._GRID_WARNED["sensor.g"] is False
     w.state.get_map["sensor.g"] = None
     assert tesla._read_grid_power("sensor.g") is None
+
+
+def test_read_grid_power_missing_entity_raises_nameerror(tesla, monkeypatch):
+    """pyscript raises NameError for a non-existent entity (integration
+    disabled); treat it like unavailable: None + one warning."""
+    tesla._GRID_WARNED.clear()
+    class _State:
+        def get(self, entity_id):
+            raise NameError(f"name '{entity_id}' is not defined")
+    class _Log:
+        def __init__(self): self.records = []
+        def warning(self, msg): self.records.append(("warning", msg))
+        def info(self, msg): self.records.append(("info", msg))
+    log = _Log()
+    monkeypatch.setattr(tesla, "state", _State())
+    monkeypatch.setattr(tesla, "log", log)
+    assert tesla._read_grid_power("sensor.power_meter_active_power") is None
+    assert tesla._read_grid_power("sensor.power_meter_active_power") is None
+    assert len([r for r in log.records if r[0] == "warning"]) == 1

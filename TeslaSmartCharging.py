@@ -1989,12 +1989,14 @@ def _read_grid_power(entity_id):
     Warns once per entity while it stays unavailable (the control loop runs
     every 15 minutes and the sensor may be gone for weeks), and logs recovery.
     """
-    raw = state.get(entity_id)
+    raw = None
     try:
+        # NameError: entity does not exist at all (integration disabled/removed).
+        raw = state.get(entity_id)
         if raw in (None, 'unavailable', 'unknown'):
             raise ValueError(raw)
         value = float(raw)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, NameError):
         if not _GRID_WARNED.get(entity_id):
             log.warning(f"Grid power sensor unavailable ({entity_id}): {raw}")
             _GRID_WARNED[entity_id] = True
