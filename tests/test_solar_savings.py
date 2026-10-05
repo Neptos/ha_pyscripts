@@ -19,14 +19,27 @@ def _hist_row(updated_dt, value):
 
 
 def test_overall_savings(savings):
-    # (10*(5-2) + 4*2)/100 = 38/100 = 0.38
+    # buy 10 * 3 direct + sell 4 * (2 exported + 1 stored) = 42 -> 0.42
     result = savings._calculate_overall_solar_savings_last_hour(
-        last_hour_exported_kwh=2,
-        last_hour_produced_kwh=5,
-        last_hour_buy_price=10,
-        last_hour_sell_price=4,
+        solar_to_house_kwh=3, solar_to_grid_kwh=2, solar_to_battery_kwh=1,
+        buy_price=10, sell_price=4,
     )
-    assert result == pytest.approx(0.38)
+    assert result == pytest.approx(0.42)
+
+
+def test_battery_savings_sign_and_value(savings):
+    # charging hour: -(10*2 grid in) - (4*1 solar in) = -24 -> -0.24
+    charging = savings._calculate_battery_savings_last_hour(
+        battery_to_house_kwh=0, battery_to_grid_kwh=0, grid_to_battery_kwh=2, solar_to_battery_kwh=1,
+        buy_price=10, sell_price=4,
+    )
+    assert charging == pytest.approx(-0.24)
+    # discharging hour: 10*2.5 to house + 4*0.5 to grid = 27 -> 0.27
+    discharging = savings._calculate_battery_savings_last_hour(
+        battery_to_house_kwh=2.5, battery_to_grid_kwh=0.5, grid_to_battery_kwh=0, solar_to_battery_kwh=0,
+        buy_price=10, sell_price=4,
+    )
+    assert discharging == pytest.approx(0.27)
 
 
 def test_car_without_solar(savings):
@@ -198,26 +211,6 @@ def test_weighted_avg_single_price_point_shortcut(savings, monkeypatch):
 
 # --- M4: netting + share-of-purchase -----------------------------------------
 
-def test_net_energy_flows_purchased_exceeds_exported(savings):
-    purchased, exported, solar = savings._net_energy_flows(5.0, 2.0, 1.0)
-    assert purchased == pytest.approx(3.0)
-    assert exported == pytest.approx(0.0)
-    assert solar == pytest.approx(3.0)  # 1.0 + 2.0 moved into self-consumption
-
-
-def test_net_energy_flows_exported_exceeds_purchased(savings):
-    purchased, exported, solar = savings._net_energy_flows(2.0, 5.0, 1.0)
-    assert purchased == pytest.approx(0.0)
-    assert exported == pytest.approx(3.0)
-    assert solar == pytest.approx(3.0)  # 1.0 + 2.0
-
-
-def test_net_energy_flows_no_overlap_unchanged(savings):
-    # Only exporting, nothing purchased -> no netting.
-    purchased, exported, solar = savings._net_energy_flows(0.0, 5.0, 1.0)
-    assert (purchased, exported, solar) == (0.0, 5.0, 1.0)
-
-
 def test_share_of_purchase_zero_when_nothing_purchased(savings):
     assert savings._share_of_purchase(3.0, 0.0, 4.0) == 0.0
 
@@ -282,116 +275,100 @@ def test_sum_value_to_sensor_starts_from_zero_on_unknown(savings, world):
 
 # --- M4/M7/M8: full calculateSolarSavingsLastHour world test -----------------
 
+FLOWS = {
+    "solar_to_house": "sensor.kotiakku_solar_to_house_kwh",
+    "solar_to_grid": "sensor.kotiakku_solar_to_grid_kwh",
+    "solar_to_battery": "sensor.kotiakku_solar_to_battery_kwh",
+    "grid_to_house": "sensor.kotiakku_grid_to_house_kwh",
+    "grid_to_battery": "sensor.kotiakku_grid_to_battery_kwh",
+    "battery_to_house": "sensor.kotiakku_battery_to_house_kwh",
+    "battery_to_grid": "sensor.kotiakku_battery_to_grid_kwh",
+}
+HELPERS = (
+    "input_number.solar_savings",
+    "input_number.battery_savings",
+    "input_number.car_charge_without_solar",
+    "input_number.car_charge_with_solar",
+    "input_number.heat_pump_cost_without_solar",
+    "input_number.heat_pump_cost_with_solar",
+    "input_number.heat_pump_consumed_kwh",
+)
+
+
+def _flow_history(deltas):
+    """History rows for each Kotiakku flow total rising by the given kWh."""
+    return {FLOWS[k]: [_hist_row(BASE, 100.0), _hist_row(BASE, 100.0 + v)] for k, v in deltas.items()}
+
+
 def test_calculate_solar_savings_full_flow(savings, world, monkeypatch):
-    """Primed histories including one 'unavailable' row: all six accumulators
-    written, no exception (crashed before the M8 fix)."""
-    exported = "sensor.power_meter_exported"
-    yield_id = "sensor.inverter_total_yield"
+    """One hour with every flow active: solar 3 direct, 2 exported, 1 stored;
+    grid 4 to house, 2 to battery; battery 1 to house. Buy 10, sell 4 c/kWh.
+    Car charged 2 kWh, heat pump used 1.5 kWh. One 'unavailable' row must be
+    tolerated (M8)."""
     tesla = "sensor.tesla_wall_connector_energy"
-    purchased = "sensor.power_meter_consumption"
+    history = _flow_history({
+        "solar_to_house": 3.0, "solar_to_grid": 2.0, "solar_to_battery": 1.0,
+        "grid_to_house": 4.0, "grid_to_battery": 2.0,
+        "battery_to_house": 1.0, "battery_to_grid": 0.0,
+    })
+    history[FLOWS["solar_to_house"]].insert(1, types.SimpleNamespace(state="unavailable", last_updated=BASE))
+    history[tesla] = [_hist_row(BASE, 0.0), _hist_row(BASE, 2000.0)]
 
-    history = {
-        exported: [_hist_row(BASE, 0.0), _hist_row(BASE, 1.0)],
-        yield_id: [
-            _hist_row(BASE, 10.0),
-            types.SimpleNamespace(state="unavailable", last_updated=BASE),
-            _hist_row(BASE, 14.0),
-        ],
-        tesla: [_hist_row(BASE, 0.0), _hist_row(BASE, 2000.0)],
-        purchased: [_hist_row(BASE, 0.0), _hist_row(BASE, 3.0)],
-    }
-
-    monkeypatch.setattr(savings, "_calculate_weighted_average_price", lambda *a, **k: 5.0)
+    monkeypatch.setattr(savings, "_calculate_weighted_average_price",
+                        lambda start, end, price_id, *a, **k: 10.0 if "nordpool" in price_id else 4.0)
     monkeypatch.setattr(savings, "_get_history", lambda *a, **k: history)
     monkeypatch.setattr(savings, "_get_statistic", lambda *a, **k: pytest.fail("prices should not fall back"))
 
-    get_map = {
-        "sensor.nibe_energy_used_last_hour": "1.5",
-        purchased: "3.0",
-        exported: "1.0",
-        yield_id: "14.0",
-        "input_number.solar_savings": "0",
-        "input_number.car_charge_without_solar": "0",
-        "input_number.car_charge_with_solar": "0",
-        "input_number.heat_pump_cost_without_solar": "0",
-        "input_number.heat_pump_cost_with_solar": "0",
-        "input_number.heat_pump_consumed_kwh": "0",
-    }
-    attrs = {k: {"device_class": "monetary"} for k in get_map if k.startswith("input_number.")}
+    get_map = {"sensor.nibe_energy_used_last_hour": "1.5"}
+    get_map.update({e: "100" for e in FLOWS.values()})
+    get_map.update({h: "0" for h in HELPERS})
+    attrs = {h: {"device_class": "monetary"} for h in HELPERS}
     w = world(savings, get=get_map, attrs=attrs)
 
     savings.calculateSolarSavingsLastHour()
 
-    written = {entity for entity, _ in w.state.set_calls}
-    for helper in (
-        "input_number.solar_savings",
-        "input_number.car_charge_without_solar",
-        "input_number.car_charge_with_solar",
-        "input_number.heat_pump_cost_without_solar",
-        "input_number.heat_pump_cost_with_solar",
-        "input_number.heat_pump_consumed_kwh",
-    ):
-        assert helper in written
+    written = dict(w.state.set_calls)
+    # solar: 10*3 + 4*(2+1) = 42 c
+    assert written["input_number.solar_savings"] == pytest.approx(0.42)
+    # battery: 10*1 to house - 10*2 grid in - 4*1 solar in = -14 c
+    assert written["input_number.battery_savings"] == pytest.approx(-0.14)
+    # house total 3+4+1 = 8 kWh, non-solar 5 kWh -> car share 2/8, pump share 1.5/8
+    assert written["input_number.car_charge_without_solar"] == pytest.approx(0.20)
+    assert written["input_number.car_charge_with_solar"] == pytest.approx(10 * 5 * (2 / 8) / 100)
+    assert written["input_number.heat_pump_cost_without_solar"] == pytest.approx(0.15)
+    assert written["input_number.heat_pump_cost_with_solar"] == pytest.approx(10 * 5 * (1.5 / 8) / 100)
+    assert written["input_number.heat_pump_consumed_kwh"] == pytest.approx(1.5)
 
 
-# --- M7: caller-side fallback-price guard (SolarSavings.py:258-269) -----------
-
-BUY = "sensor.nordpool_kwh_fi_eur_3_10_0"
-SELL = "sensor.electricity_sell_price"
-
-
-def _run_with_fallback_stat(savings, world, monkeypatch, stat_return):
-    """Force the weighted-price path to fail and drive the fallback _get_statistic.
-
-    Returns the _World so callers can assert on log/writes. With the L4 change
-    the combined history fetch runs FIRST, so it is stubbed to a valid dict;
-    the price-fallback guard (weighted avg None + missing/empty stat) must still
-    warn and skip before any accumulator write.
-    """
-    monkeypatch.setattr(savings, "_calculate_weighted_average_price", lambda *a, **k: None)
-    monkeypatch.setattr(savings, "_get_statistic", lambda *a, **k: stat_return)
-    history = {
-        "sensor.power_meter_exported": [_hist_row(BASE, 0.0), _hist_row(BASE, 1.0)],
-        "sensor.inverter_total_yield": [_hist_row(BASE, 10.0), _hist_row(BASE, 14.0)],
-        "sensor.tesla_wall_connector_energy": [_hist_row(BASE, 0.0), _hist_row(BASE, 2000.0)],
-        "sensor.power_meter_consumption": [_hist_row(BASE, 0.0), _hist_row(BASE, 3.0)],
-    }
+def test_calculate_solar_savings_skips_battery_metric_when_helper_missing(savings, world, monkeypatch):
+    """input_number.battery_savings not created yet: pyscript raises NameError on
+    state.get; book everything else, warn once, never write the missing helper."""
+    tesla = "sensor.tesla_wall_connector_energy"
+    history = _flow_history({k: 1.0 for k in FLOWS})
+    history[tesla] = [_hist_row(BASE, 0.0), _hist_row(BASE, 1000.0)]
+    monkeypatch.setattr(savings, "_calculate_weighted_average_price", lambda *a, **k: 10.0)
     monkeypatch.setattr(savings, "_get_history", lambda *a, **k: history)
-    w = world(savings, get={"sensor.nibe_energy_used_last_hour": "1.5"})
+
+    get_map = {"sensor.nibe_energy_used_last_hour": "1.0"}
+    get_map.update({e: "100" for e in FLOWS.values()})
+    get_map.update({h: "0" for h in HELPERS if h != "input_number.battery_savings"})
+    w = world(savings, get=get_map, attrs={h: {"device_class": "monetary"} for h in HELPERS})
+
+    class _State(type(w.state)):
+        def get(self, entity):
+            if entity == "input_number.battery_savings":
+                raise NameError("name 'input_number.battery_savings' is not defined")
+            return super().get(entity)
+    w.state.__class__ = _State
+    savings._WARNED.clear()
+
     savings.calculateSolarSavingsLastHour()
-    return w
+    savings.calculateSolarSavingsLastHour()
 
-
-def test_fallback_guard_missing_buy_key_warns_and_skips(savings, world, monkeypatch):
-    """Weighted avg None + stat dict missing the buy key -> warn, no accumulator writes."""
-    w = _run_with_fallback_stat(
-        savings, world, monkeypatch, {SELL: [{"state": "2.0"}]}
-    )
-    assert w.state.set_calls == []
-    assert any(level == "warning" and "buy price" in msg for level, msg in w.log.records)
-
-
-def test_fallback_guard_empty_dict_warns_and_skips(savings, world, monkeypatch):
-    """Weighted avg None + empty stat dict -> warn, no accumulator writes."""
-    w = _run_with_fallback_stat(savings, world, monkeypatch, {})
-    assert w.state.set_calls == []
-    assert any(level == "warning" and "buy price" in msg for level, msg in w.log.records)
-
-
-def test_fallback_guard_none_stat_warns_and_skips(savings, world, monkeypatch):
-    """Weighted avg None + _get_statistic returns None (timeout) -> warn, no writes."""
-    w = _run_with_fallback_stat(savings, world, monkeypatch, None)
-    assert w.state.set_calls == []
-    assert any(level == "warning" and "buy price" in msg for level, msg in w.log.records)
-
-
-def test_fallback_guard_missing_sell_key_warns_and_skips(savings, world, monkeypatch):
-    """Buy present, sell key missing -> the sell guard warns, no accumulator writes."""
-    w = _run_with_fallback_stat(
-        savings, world, monkeypatch, {BUY: [{"state": "5.0"}]}
-    )
-    assert w.state.set_calls == []
-    assert any(level == "warning" and "sell price" in msg for level, msg in w.log.records)
+    written = {entity for entity, _ in w.state.set_calls}
+    assert "input_number.battery_savings" not in written
+    assert "input_number.solar_savings" in written
+    assert len([r for r in w.log.records if r[0] == "warning" and "battery_savings" in r[1]]) == 1
 
 
 def test_calculate_solar_savings_totals_unavailable_books_no_solar_benefit(savings, world, monkeypatch):
@@ -403,13 +380,11 @@ def test_calculate_solar_savings_totals_unavailable_books_no_solar_benefit(savin
 
     monkeypatch.setattr(savings, "_calculate_weighted_average_price", lambda *a, **k: 10.0)
     monkeypatch.setattr(savings, "_get_history", lambda *a, **k: history)
-    monkeypatch.setattr(savings, "_net_energy_flows", lambda *a, **k: pytest.fail("solar path must be skipped"))
+    monkeypatch.setattr(savings, "_calculate_overall_solar_savings_last_hour", lambda *a, **k: pytest.fail("solar path must be skipped"))
 
     get_map = {
         "sensor.nibe_energy_used_last_hour": "1.5",
-        "sensor.power_meter_consumption": "unavailable",
-        "sensor.power_meter_exported": "unavailable",
-        "sensor.inverter_total_yield": "unavailable",
+        "sensor.kotiakku_solar_to_house_kwh": "unavailable",
         "input_number.solar_savings": "100",
         "input_number.car_charge_without_solar": "0",
         "input_number.car_charge_with_solar": "0",

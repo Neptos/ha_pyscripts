@@ -72,24 +72,6 @@ def _delta_from_history(rows):
     return valid[-1] - valid[0]
 
 
-def _net_energy_flows(purchased_kwh, exported_kwh, consumed_solar_kwh):
-    """Net purchased against exported kWh within the same hour.
-
-    Returns (purchased, exported, consumed_solar) with the overlap moved into
-    self-consumed solar. No-op when there is no overlap.
-    """
-    if exported_kwh > 0.001 and purchased_kwh > 0.001:
-        if purchased_kwh >= exported_kwh:
-            purchased_kwh = purchased_kwh - exported_kwh
-            consumed_solar_kwh = consumed_solar_kwh + exported_kwh
-            exported_kwh = 0.0
-        else:
-            exported_kwh = exported_kwh - purchased_kwh
-            consumed_solar_kwh = consumed_solar_kwh + purchased_kwh
-            purchased_kwh = 0.0
-    return purchased_kwh, exported_kwh, consumed_solar_kwh
-
-
 def _share_of_purchase(consumer_kwh, purchased_kwh, produced_kwh):
     """Consumer's proportional share of purchased energy (0.0 when nothing purchased)."""
     if purchased_kwh > 0.001:
@@ -220,8 +202,21 @@ def _calculate_weighted_average_price(start_time, end_time, price_entity_id, con
         return None
 
 
-def _calculate_overall_solar_savings_last_hour(last_hour_exported_kwh, last_hour_produced_kwh, last_hour_buy_price, last_hour_sell_price):
-    return (last_hour_buy_price * (last_hour_produced_kwh - last_hour_exported_kwh) + last_hour_sell_price * last_hour_exported_kwh)/100.0
+def _calculate_overall_solar_savings_last_hour(solar_to_house_kwh, solar_to_grid_kwh, solar_to_battery_kwh, buy_price, sell_price):
+    """EUR saved by the panels this hour: direct use avoids the buy price; the
+    rest is valued at the sell price whether exported now or stored. The extra
+    value of stored solar is booked in the battery metric, so nothing is counted twice."""
+    return (buy_price * solar_to_house_kwh + sell_price * (solar_to_grid_kwh + solar_to_battery_kwh)) / 100.0
+
+
+def _calculate_battery_savings_last_hour(battery_to_house_kwh, battery_to_grid_kwh, grid_to_battery_kwh, solar_to_battery_kwh, buy_price, sell_price):
+    """EUR net effect of the battery this hour: discharge to the house avoids the
+    buy price, discharge to grid earns the sell price, grid charging costs the
+    buy price, and absorbed solar is charged at the sell price it displaced.
+    Negative in charging hours, positive in discharging hours; the running sum
+    is the battery's net benefit (Elisa's arbitrage plus stored-solar uplift)."""
+    return (buy_price * battery_to_house_kwh + sell_price * battery_to_grid_kwh
+            - buy_price * grid_to_battery_kwh - sell_price * solar_to_battery_kwh) / 100.0
 
 
 def _calculate_car_charge_cost_without_solar_last_hour(last_hour_buy_price, last_hour_charged_kwh):
@@ -254,21 +249,49 @@ def _energy_totals_available(*entity_ids):
     return True
 
 
+_WARNED = {}
+
+
+def _helper_exists(entity_id):
+    """True when the input_number helper exists; warns once per helper if not."""
+    try:
+        state.get(entity_id)
+        return True
+    except NameError:
+        if not _WARNED.get(entity_id):
+            log.warning(f"Helper {entity_id} missing, create it in HA to track this metric")
+            _WARNED[entity_id] = True
+        return False
+
+
 @time_trigger("cron(2 * * * *)")
 def calculateSolarSavingsLastHour():
-    """Calculate the savings from solar panels during the previous hour"""
+    """Book last hour's solar and battery value from the Elisa Kotiakku flow totals."""
     # Read entities
     buy_price_entity_id = 'sensor.nordpool_kwh_fi_eur_3_10_0'
     sell_price_entity_id = 'sensor.electricity_sell_price'
     tesla_wallconnector_energy_entity_id = 'sensor.tesla_wall_connector_energy'
-    purchased_kwh_total_entity_id = 'sensor.power_meter_consumption'
-    exported_kwh_total_entity_id = 'sensor.power_meter_exported'
-    inverter_yield_kwh_total_entity_id = 'sensor.inverter_total_yield'
     nibe_energy_used_last_hour_kwh_total_entity_id = 'sensor.nibe_energy_used_last_hour'
+    # Elisa Kotiakku integration flow totals (kWh, total_increasing, 5-min updates)
+    grid_import_kwh_total_entity_id = 'sensor.kotiakku_total_grid_import_kwh'
+    grid_export_kwh_total_entity_id = 'sensor.kotiakku_total_grid_export_kwh'
+    solar_to_house_kwh_total_entity_id = 'sensor.kotiakku_solar_to_house_kwh'
+    solar_to_grid_kwh_total_entity_id = 'sensor.kotiakku_solar_to_grid_kwh'
+    solar_to_battery_kwh_total_entity_id = 'sensor.kotiakku_solar_to_battery_kwh'
+    grid_to_house_kwh_total_entity_id = 'sensor.kotiakku_grid_to_house_kwh'
+    grid_to_battery_kwh_total_entity_id = 'sensor.kotiakku_grid_to_battery_kwh'
+    battery_to_house_kwh_total_entity_id = 'sensor.kotiakku_battery_to_house_kwh'
+    battery_to_grid_kwh_total_entity_id = 'sensor.kotiakku_battery_to_grid_kwh'
+    flow_entity_ids = [
+        solar_to_house_kwh_total_entity_id, solar_to_grid_kwh_total_entity_id, solar_to_battery_kwh_total_entity_id,
+        grid_to_house_kwh_total_entity_id, grid_to_battery_kwh_total_entity_id,
+        battery_to_house_kwh_total_entity_id, battery_to_grid_kwh_total_entity_id,
+    ]
 
     # Write entities
     # These have to be created as helpers in HA
     solar_savings_entity_id = 'input_number.solar_savings'
+    battery_savings_entity_id = 'input_number.battery_savings'
     car_charge_cost_without_solar_entity_id = 'input_number.car_charge_without_solar'
     car_charge_cost_with_solar_entity_id = 'input_number.car_charge_with_solar'
     heat_pump_cost_without_solar_entity_id = 'input_number.heat_pump_cost_without_solar'
@@ -281,21 +304,22 @@ def calculateSolarSavingsLastHour():
     last_hour_end = datetime.now()
     last_hour_end = last_hour_end.replace(minute=0, second=0, microsecond=0)
 
-    # Fetch all energy history once (L4): the weighted-price calls reuse the
-    # purchased/exported row lists instead of issuing 2 more recorder queries.
-    last_hour_history = _get_history(last_hour_start, last_hour_end, [exported_kwh_total_entity_id, inverter_yield_kwh_total_entity_id, tesla_wallconnector_energy_entity_id, purchased_kwh_total_entity_id], True, False, False, True)
+    # Fetch all energy history once; the weighted-price calls reuse the
+    # grid import/export row lists instead of issuing more recorder queries.
+    history_entity_ids = flow_entity_ids + [grid_import_kwh_total_entity_id, grid_export_kwh_total_entity_id, tesla_wallconnector_energy_entity_id]
+    last_hour_history = _get_history(last_hour_start, last_hour_end, history_entity_ids, True, False, False, True)
     if not last_hour_history:
         log.warning("No history available for last hour, skipping")
         return
 
-    # Calculate consumption-weighted spot prices for 15-minute intervals
-    # Uses purchased electricity to weight buy price, exported to weight sell price
+    # Consumption-weighted spot prices: grid import weights the buy price,
+    # grid export weights the sell price.
     last_hour_buy_price = _calculate_weighted_average_price(
-        last_hour_start, last_hour_end, buy_price_entity_id, purchased_kwh_total_entity_id,
-        consumption_history=last_hour_history.get(purchased_kwh_total_entity_id))
+        last_hour_start, last_hour_end, buy_price_entity_id, grid_import_kwh_total_entity_id,
+        consumption_history=last_hour_history.get(grid_import_kwh_total_entity_id))
     last_hour_sell_price = _calculate_weighted_average_price(
-        last_hour_start, last_hour_end, sell_price_entity_id, exported_kwh_total_entity_id,
-        consumption_history=last_hour_history.get(exported_kwh_total_entity_id))
+        last_hour_start, last_hour_end, sell_price_entity_id, grid_export_kwh_total_entity_id,
+        consumption_history=last_hour_history.get(grid_export_kwh_total_entity_id))
 
     # Fallback to simple average if weighted calculation failed
     if last_hour_buy_price is None or last_hour_sell_price is None:
@@ -311,14 +335,14 @@ def calculateSolarSavingsLastHour():
                 return
             last_hour_sell_price = float(last_hour_prices[sell_price_entity_id][0]['state'])
 
-    # Grid meter and inverter data gone (Elisa Kotiakku took over the inverter
-    # 2026-10-05; P1 meter reader not yet installed). Without purchased/exported
-    # kWh the solar share is unknown, so claim no solar benefit: cost with solar
-    # equals cost without, overall savings unchanged, heat pump kWh still tracked.
     last_hour_heat_pump_used_kwh = float(state.get(nibe_energy_used_last_hour_kwh_total_entity_id))
     last_hour_charged_kwh = _delta_from_history(last_hour_history.get(tesla_wallconnector_energy_entity_id, []))/1000.0
-    if not _energy_totals_available(purchased_kwh_total_entity_id, exported_kwh_total_entity_id, inverter_yield_kwh_total_entity_id):
-        log.info("Grid/inverter energy totals unavailable, booking costs without solar benefit")
+
+    # Without the flow totals the solar share is unknown: claim no solar
+    # benefit (cost with solar equals cost without), leave the savings
+    # metrics untouched, keep tracking heat pump kWh.
+    if not _energy_totals_available(*flow_entity_ids):
+        log.info("Kotiakku energy flow totals unavailable, booking costs without solar benefit")
         car_cost = _calculate_car_charge_cost_without_solar_last_hour(last_hour_buy_price, last_hour_charged_kwh)
         heat_pump_cost = _calculate_heat_pump_cost_without_solar_last_hour(last_hour_buy_price, last_hour_heat_pump_used_kwh)
         _sum_value_to_sensor(car_cost, car_charge_cost_without_solar_entity_id)
@@ -328,33 +352,43 @@ def calculateSolarSavingsLastHour():
         _sum_value_to_sensor(last_hour_heat_pump_used_kwh, heat_pump_consumed_kwh_entity_id)
         return
 
-    # Calculate energy usages last hour
-    last_hour_exported_kwh = _delta_from_history(last_hour_history.get(exported_kwh_total_entity_id, []))
-    last_hour_produced_kwh = _delta_from_history(last_hour_history.get(inverter_yield_kwh_total_entity_id, []))
-    last_hour_purchased_kwh = _delta_from_history(last_hour_history.get(purchased_kwh_total_entity_id, []))
-    last_hour_consumed_solar = last_hour_produced_kwh - last_hour_exported_kwh
+    # Energy flows last hour (kWh)
+    solar_to_house_kwh = _delta_from_history(last_hour_history.get(solar_to_house_kwh_total_entity_id, []))
+    solar_to_grid_kwh = _delta_from_history(last_hour_history.get(solar_to_grid_kwh_total_entity_id, []))
+    solar_to_battery_kwh = _delta_from_history(last_hour_history.get(solar_to_battery_kwh_total_entity_id, []))
+    grid_to_house_kwh = _delta_from_history(last_hour_history.get(grid_to_house_kwh_total_entity_id, []))
+    grid_to_battery_kwh = _delta_from_history(last_hour_history.get(grid_to_battery_kwh_total_entity_id, []))
+    battery_to_house_kwh = _delta_from_history(last_hour_history.get(battery_to_house_kwh_total_entity_id, []))
+    battery_to_grid_kwh = _delta_from_history(last_hour_history.get(battery_to_grid_kwh_total_entity_id, []))
 
-    # Correct for kWh purchased exchange for kWh exported during the hour
-    last_hour_purchased_kwh, last_hour_exported_kwh, last_hour_consumed_solar = _net_energy_flows(
-        last_hour_purchased_kwh, last_hour_exported_kwh, last_hour_consumed_solar)
-
-    # Consumers share purchased cost based on their % usage of total
-    car_share_of_purchase = _share_of_purchase(last_hour_charged_kwh, last_hour_purchased_kwh, last_hour_produced_kwh)
-    heat_pump_share_of_purchase = _share_of_purchase(last_hour_heat_pump_used_kwh, last_hour_purchased_kwh, last_hour_produced_kwh)
+    # Consumers share the non-solar (grid + battery) part of house consumption
+    # in proportion to their usage; battery energy is priced as grid energy
+    # here so the battery's benefit shows up only in the battery metric.
+    non_solar_house_kwh = grid_to_house_kwh + battery_to_house_kwh
+    car_share_of_purchase = _share_of_purchase(last_hour_charged_kwh, non_solar_house_kwh, solar_to_house_kwh)
+    heat_pump_share_of_purchase = _share_of_purchase(last_hour_heat_pump_used_kwh, non_solar_house_kwh, solar_to_house_kwh)
 
     # Overall solar savings
-    overall_savings_last_hour = _calculate_overall_solar_savings_last_hour(last_hour_exported_kwh, last_hour_produced_kwh, last_hour_buy_price, last_hour_sell_price)
+    overall_savings_last_hour = _calculate_overall_solar_savings_last_hour(
+        solar_to_house_kwh, solar_to_grid_kwh, solar_to_battery_kwh, last_hour_buy_price, last_hour_sell_price)
     _sum_value_to_sensor(overall_savings_last_hour, solar_savings_entity_id)
+
+    # Battery net benefit (helper is new; skip until created)
+    if _helper_exists(battery_savings_entity_id):
+        battery_savings_last_hour = _calculate_battery_savings_last_hour(
+            battery_to_house_kwh, battery_to_grid_kwh, grid_to_battery_kwh, solar_to_battery_kwh,
+            last_hour_buy_price, last_hour_sell_price)
+        _sum_value_to_sensor(battery_savings_last_hour, battery_savings_entity_id)
 
     # Car charge cost and savings
     car_charge_cost_without_solar_last_hour = _calculate_car_charge_cost_without_solar_last_hour(last_hour_buy_price, last_hour_charged_kwh)
-    car_charge_cost_with_solar_last_hour = _calculate_car_charge_cost_with_solar_last_hour(last_hour_buy_price, last_hour_purchased_kwh, car_share_of_purchase)
+    car_charge_cost_with_solar_last_hour = _calculate_car_charge_cost_with_solar_last_hour(last_hour_buy_price, non_solar_house_kwh, car_share_of_purchase)
     _sum_value_to_sensor(car_charge_cost_without_solar_last_hour, car_charge_cost_without_solar_entity_id)
     _sum_value_to_sensor(car_charge_cost_with_solar_last_hour, car_charge_cost_with_solar_entity_id)
 
     # Heat pump cost and savings
     heat_pump_cost_without_solar_last_hour = _calculate_heat_pump_cost_without_solar_last_hour(last_hour_buy_price, last_hour_heat_pump_used_kwh)
-    heat_pump_cost_with_solar_last_hour = _calculate_heat_pump_cost_with_solar_last_hour(last_hour_buy_price, last_hour_purchased_kwh, heat_pump_share_of_purchase)
+    heat_pump_cost_with_solar_last_hour = _calculate_heat_pump_cost_with_solar_last_hour(last_hour_buy_price, non_solar_house_kwh, heat_pump_share_of_purchase)
     _sum_value_to_sensor(heat_pump_cost_without_solar_last_hour, heat_pump_cost_without_solar_entity_id)
     _sum_value_to_sensor(heat_pump_cost_with_solar_last_hour, heat_pump_cost_with_solar_entity_id)
 

@@ -32,19 +32,19 @@ Home Assistant pyscript collection for calculating solar panel savings and elect
 ## Scripts
 
 ### SolarSavings.py
-Calculates savings from solar panels by comparing actual costs vs theoretical costs without solar.
+Books the hourly value of the solar panels and the Elisa-controlled home battery from the Elisa Kotiakku integration's energy flow totals, and splits non-solar cost onto the car and heat pump.
 
 **Read Sensors** (update these for your installation):
 - `sensor.nordpool_kwh_fi_eur_3_10_0` - Buy price
 - `sensor.electricity_sell_price` - Sell price
 - `sensor.tesla_wall_connector_energy` - Car charging energy
-- `sensor.power_meter_consumption` - Purchased electricity
-- `sensor.power_meter_exported` - Exported electricity
-- `sensor.inverter_total_yield` - Solar production
 - `sensor.nibe_energy_used_last_hour` - Heat pump usage
+- `sensor.kotiakku_total_grid_import_kwh` / `sensor.kotiakku_total_grid_export_kwh` - weights for the buy/sell price averages
+- `sensor.kotiakku_solar_to_house_kwh`, `sensor.kotiakku_solar_to_grid_kwh`, `sensor.kotiakku_solar_to_battery_kwh`, `sensor.kotiakku_grid_to_house_kwh`, `sensor.kotiakku_grid_to_battery_kwh`, `sensor.kotiakku_battery_to_house_kwh`, `sensor.kotiakku_battery_to_grid_kwh` - per-flow kWh totals (Jarauvi/elisa_kotiakku integration, 5-minute updates)
 
 **Write Sensors** (create as input_number helpers):
 - `input_number.solar_savings`
+- `input_number.battery_savings` (skipped with a one-time warning until created)
 - `input_number.car_charge_without_solar`
 - `input_number.car_charge_with_solar`
 - `input_number.heat_pump_cost_without_solar`
@@ -52,10 +52,11 @@ Calculates savings from solar panels by comparing actual costs vs theoretical co
 - `input_number.heat_pump_consumed_kwh`
 
 **Logic**:
-- Calculates consumption-weighted average prices using 15-min intervals (lines 190-201)
-- Falls back to simple average if weighted calculation fails
-- Handles bidirectional energy flow correction where purchased and exported kWh during same hour are netted against each other
-- Distributes purchased energy costs to car/heat pump based on their proportional usage
+- Consumption-weighted buy/sell prices over 5-minute intervals (grid import weights buy, grid export weights sell); simple average fallback
+- Solar savings = buy x solar_to_house + sell x (solar_to_grid + solar_to_battery): direct use avoids the buy price, everything else is valued at the sell price it would have earned
+- Battery savings = buy x battery_to_house + sell x battery_to_grid - buy x grid_to_battery - sell x solar_to_battery: negative in charging hours, positive when discharging; the running sum is the battery's net benefit. Stored solar is charged here at the sell price, so the two metrics never double count
+- Car/heat pump "with solar" cost = their share of the non-solar house consumption (grid_to_house + battery_to_house), priced at the buy price; battery energy is deliberately priced as grid energy so the battery's benefit appears only in the battery metric
+- When the flow totals are unavailable, books cost-with-solar equal to cost-without-solar and leaves the savings metrics untouched
 
 ### UpdateSpotPriceSensors.py
 Creates electricity cost indicators (0-3 scale) based on short-term (today+tomorrow) and long-term (10 days) price trends.
