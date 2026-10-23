@@ -10,7 +10,6 @@ HEATING_RATE_PER_15MIN = 1.25  # °C per 15-min heating interval (net, after los
 MORNING_GUARANTEE_MAX_INTERVALS = 8  # 2 hours max (8 x 15min)
 DAILY_BLOCK_INTERVALS = 12     # 3 hours (12 x 15min)
 PLAN_WINDOW_HOURS = 24
-PLAN_STALE_HOURS = 36          # replan from today's prices if tomorrow's never arrived
 SOLAR_POWER_THRESHOLD = 3000   # Watts
 
 
@@ -71,29 +70,24 @@ def _normalize_price_data(price_dictionaries):
 def _load_price_intervals():
     """Read nordpool prices as normalized 15-min intervals.
 
-    Returns (intervals, tomorrow_date, source_string); tomorrow_date is the
-    ISO date of tomorrow's prices, or None while they are not published.
+    Returns (intervals, source_string).
     """
     spot = sensor.nordpool_kwh_fi_eur_3_10_0
 
     raw_today = spot.raw_today
     if not raw_today:
-        return [], None, "no_data"
+        return [], "no_data"
 
     intervals = _normalize_price_data(raw_today)
-    tomorrow_date = None
     source = "today_only"
 
     if spot.tomorrow_valid:
         raw_tomorrow = spot.raw_tomorrow
         if raw_tomorrow:
-            tomorrow = _normalize_price_data(raw_tomorrow)
-            if tomorrow:
-                intervals += tomorrow
-                tomorrow_date = tomorrow[0]['start'].astimezone().date().isoformat()
-                source = "today_tomorrow"
+            intervals += _normalize_price_data(raw_tomorrow)
+            source = "today_tomorrow"
 
-    return intervals, tomorrow_date, source
+    return intervals, source
 
 
 def _build_hourly_price_pool(intervals):
@@ -162,35 +156,31 @@ def _select_cheapest_block(intervals, window_start, window_end):
     }
 
 
-def _plan_daily_block(prev_plan, intervals, tomorrow_date, now):
+def _plan_daily_block(prev_plan, intervals, now):
     """Return the daily heating block plan, replanning only when due.
 
-    A plan is made once tomorrow's prices are published and covers the next
-    PLAN_WINDOW_HOURS. It is then kept, even after its block has run, until
-    the next day's prices arrive, so the block cannot drift onto pricier
-    hours as cheap ones pass. New prices never replace a block that has not
-    finished. Without a usable plan (first run, restart, prices missing for
-    PLAN_STALE_HOURS) it plans within the prices that are available.
+    A plan is made for the newest price day, normally when tomorrow's prices
+    are published, and covers the next PLAN_WINDOW_HOURS. It is then kept,
+    even after its block has run, until a newer price day is available, so
+    the block cannot drift onto pricier hours as cheap ones pass. New prices
+    never replace a block that has not finished; if that block runs past
+    midnight, the newest price day is today's and the replan still happens.
     """
-    interval_start = now.replace(minute=now.minute // 15 * 15, second=0, microsecond=0)
-
-    new_prices = tomorrow_date is not None and (
-        prev_plan is None or prev_plan['planned_for'] != tomorrow_date)
-    stale = prev_plan is None or now - prev_plan['planned_at'] > timedelta(hours=PLAN_STALE_HOURS)
-
-    if new_prices and (prev_plan is None or prev_plan['end'] <= now):
-        planned_for = tomorrow_date
-    elif stale and tomorrow_date is None:
-        planned_for = now.date().isoformat()
-    else:
+    if not intervals:
         return prev_plan
 
+    newest_date = max([iv['start'] for iv in intervals]).astimezone().date().isoformat()
+    if prev_plan is not None and (
+            prev_plan['planned_for'] >= newest_date or prev_plan['end'] > now):
+        return prev_plan
+
+    interval_start = now.replace(minute=now.minute // 15 * 15, second=0, microsecond=0)
     window_end = now + timedelta(hours=PLAN_WINDOW_HOURS)
     block = _select_cheapest_block(intervals, interval_start, window_end)
     if block is None:
         return prev_plan
 
-    block['planned_for'] = planned_for
+    block['planned_for'] = newest_date
     block['planned_at'] = now
     return block
 
@@ -423,12 +413,12 @@ def _make_heating_decision():
     plan = None
     pool = []
     try:
-        intervals, tomorrow_date, source = _load_price_intervals()
+        intervals, source = _load_price_intervals()
         debug['schedule_source'] = source
         pool = _build_hourly_price_pool(intervals)
 
         prev_plan = _load_stored_plan(state.getattr('input_number.hot_water_heating_status') or {})
-        plan = _plan_daily_block(prev_plan, intervals, tomorrow_date, now)
+        plan = _plan_daily_block(prev_plan, intervals, now)
         if plan:
             debug.update(_plan_attributes(plan))
             debug['next_cheap_start'] = plan['start'].isoformat() if plan['end'] > now else 'none_remaining'

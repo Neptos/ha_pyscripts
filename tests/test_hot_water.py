@@ -285,7 +285,7 @@ def test_new_prices_plan_cheapest_consecutive_3h(hotwater):
         prices[40 * 4] = 0.1
         intervals = _intervals(day_start, prices)
 
-        plan = hotwater._plan_daily_block(None, intervals, "2026-01-16", now)
+        plan = hotwater._plan_daily_block(None, intervals, now)
 
         assert plan["start"] == datetime.datetime(2026, 1, 16, 3, 0, 0, tzinfo=tz)
         assert plan["end"] == datetime.datetime(2026, 1, 16, 6, 0, 0, tzinfo=tz)
@@ -305,7 +305,7 @@ def test_plan_window_limited_to_24h(hotwater):
             prices[i] = 1.0
         intervals = _intervals(day_start, prices)
 
-        plan = hotwater._plan_daily_block(None, intervals, "2026-01-16", now)
+        plan = hotwater._plan_daily_block(None, intervals, now)
 
         assert plan["start"] == datetime.datetime(2026, 1, 15, 20, 0, 0, tzinfo=tz)
 
@@ -324,7 +324,7 @@ def test_plan_kept_after_block_passed(hotwater):
         intervals = _intervals(
             datetime.datetime(2026, 1, 16, 0, 0, 0, tzinfo=tz), [10.0] * 96)
 
-        plan = hotwater._plan_daily_block(prev, intervals, None, now)
+        plan = hotwater._plan_daily_block(prev, intervals, now)
 
         assert plan is prev
 
@@ -343,11 +343,11 @@ def test_new_prices_wait_for_running_block(hotwater):
         intervals = _intervals(
             datetime.datetime(2026, 1, 16, 0, 0, 0, tzinfo=tz), [10.0] * 192)
 
-        assert hotwater._plan_daily_block(prev, intervals, "2026-01-17", now) is prev
+        assert hotwater._plan_daily_block(prev, intervals, now) is prev
 
     with freeze_time("2026-01-16 16:03:00"):
         now = datetime.datetime.now().astimezone()
-        plan = hotwater._plan_daily_block(prev, intervals, "2026-01-17", now)
+        plan = hotwater._plan_daily_block(prev, intervals, now)
         assert plan["planned_for"] == "2026-01-17"
         assert plan["start"] >= prev["end"]
 
@@ -365,30 +365,37 @@ def test_no_plan_falls_back_to_rest_of_today(hotwater):
         intervals = _intervals(
             datetime.datetime(2026, 1, 16, 0, 0, 0, tzinfo=tz), prices)
 
-        plan = hotwater._plan_daily_block(None, intervals, None, now)
+        plan = hotwater._plan_daily_block(None, intervals, now)
 
         assert plan["start"] == datetime.datetime(2026, 1, 16, 12, 0, 0, tzinfo=tz)
         assert plan["planned_for"] == "2026-01-16"
 
 
-def test_stale_plan_replanned(hotwater):
-    """Prices missing for over 36h -> fall back instead of never heating."""
-    with freeze_time("2026-01-17 08:10:00"):
+def test_block_past_midnight_replans_for_today(hotwater):
+    """New prices arrived while the block ran into midnight -> replan after it.
+
+    After midnight only today's prices are published, so the replan must key
+    on the newest price day rather than on tomorrow's prices being present.
+    """
+    with freeze_time("2026-01-17 00:03:00"):
         tz = _local_tz()
         now = datetime.datetime.now().astimezone()
         prev = _plan(
-            datetime.datetime(2026, 1, 16, 3, 0, 0, tzinfo=tz),
-            datetime.datetime(2026, 1, 16, 6, 0, 0, tzinfo=tz),
+            datetime.datetime(2026, 1, 16, 21, 0, 0, tzinfo=tz),
+            datetime.datetime(2026, 1, 17, 0, 0, 0, tzinfo=tz),
             "2026-01-16",
-            datetime.datetime(2026, 1, 15, 14, 20, 0, tzinfo=tz),
+            datetime.datetime(2026, 1, 16, 7, 12, 0, tzinfo=tz),
         )
+        prices = [10.0] * 96
+        for i in range(2 * 4, 5 * 4):       # 02:00-05:00
+            prices[i] = 1.0
         intervals = _intervals(
-            datetime.datetime(2026, 1, 17, 0, 0, 0, tzinfo=tz), [10.0] * 96)
+            datetime.datetime(2026, 1, 17, 0, 0, 0, tzinfo=tz), prices)
 
-        plan = hotwater._plan_daily_block(prev, intervals, None, now)
+        plan = hotwater._plan_daily_block(prev, intervals, now)
 
         assert plan["planned_for"] == "2026-01-17"
-        assert plan["start"] >= datetime.datetime(2026, 1, 17, 8, 0, 0, tzinfo=tz)
+        assert plan["start"] == datetime.datetime(2026, 1, 17, 2, 0, 0, tzinfo=tz)
 
 
 def test_stored_plan_round_trip(hotwater):
