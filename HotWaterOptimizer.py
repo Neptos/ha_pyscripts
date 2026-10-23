@@ -8,6 +8,9 @@ BT7_MORNING_TARGET = 50.0
 BT7_LOSS_RATE = 1.5            # °C per hour cooling rate
 HEATING_RATE_PER_15MIN = 1.25  # °C per 15-min heating interval (net, after losses)
 MORNING_GUARANTEE_MAX_INTERVALS = 8  # 2 hours max (8 x 15min)
+DAILY_BLOCK_INTERVALS = 12     # 3 hours (12 x 15min)
+PLAN_WINDOW_HOURS = 24
+PLAN_STALE_HOURS = 36          # replan from today's prices if tomorrow's never arrived
 SOLAR_POWER_THRESHOLD = 3000   # Watts
 
 
@@ -65,30 +68,42 @@ def _normalize_price_data(price_dictionaries):
     return normalized
 
 
-def _build_hourly_price_pool():
-    """Build pool of available hours with averaged prices from nordpool data.
+def _load_price_intervals():
+    """Read nordpool prices as normalized 15-min intervals.
 
-    Returns (pool, source_string) where pool is a list of
-    {hour_start, hour_end, price} dicts for current and future hours.
+    Returns (intervals, tomorrow_date, source_string); tomorrow_date is the
+    ISO date of tomorrow's prices, or None while they are not published.
     """
     spot = sensor.nordpool_kwh_fi_eur_3_10_0
 
     raw_today = spot.raw_today
     if not raw_today:
-        return [], "no_data"
+        return [], None, "no_data"
 
-    normalized = _normalize_price_data(raw_today)
+    intervals = _normalize_price_data(raw_today)
+    tomorrow_date = None
     source = "today_only"
 
     if spot.tomorrow_valid:
         raw_tomorrow = spot.raw_tomorrow
         if raw_tomorrow:
-            normalized += _normalize_price_data(raw_tomorrow)
-            source = "today_tomorrow"
+            tomorrow = _normalize_price_data(raw_tomorrow)
+            if tomorrow:
+                intervals += tomorrow
+                tomorrow_date = tomorrow[0]['start'].astimezone().date().isoformat()
+                source = "today_tomorrow"
 
+    return intervals, tomorrow_date, source
+
+
+def _build_hourly_price_pool(intervals):
+    """Build pool of current and future hours with averaged prices.
+
+    Returns a list of {hour_start, hour_end, price} dicts.
+    """
     # Group 15-min intervals by hour
     hourly = {}
-    for entry in normalized:
+    for entry in intervals:
         hour_key = entry['start'].replace(minute=0, second=0, microsecond=0)
         if hour_key not in hourly:
             hourly[hour_key] = []
@@ -110,26 +125,111 @@ def _build_hourly_price_pool():
             'price': avg_price
         })
 
-    return pool, source
+    return pool
 
 
-def _select_cheapest_hours(pool, count=3):
-    """Select the cheapest N hours from the pool, sorted chronologically."""
-    if not pool:
-        return []
+def _select_cheapest_block(intervals, window_start, window_end):
+    """Cheapest run of DAILY_BLOCK_INTERVALS consecutive intervals starting in the window.
 
-    by_price = sorted(pool, key=lambda x: x['price'])
-    cheapest = by_price[:count]
-    cheapest.sort(key=lambda x: x['hour_start'])
-    return cheapest
+    Returns {start, end, price} with price as the block's average, or None.
+    """
+    candidates = [iv for iv in intervals if window_start <= iv['start'] < window_end]
+    candidates.sort(key=lambda x: x['start'])
+
+    best_block = None
+    best_cost = float('inf')
+    for i in range(len(candidates) - DAILY_BLOCK_INTERVALS + 1):
+        block = candidates[i:i + DAILY_BLOCK_INTERVALS]
+
+        is_consecutive = True
+        for j in range(1, len(block)):
+            if block[j]['start'] != block[j - 1]['end']:
+                is_consecutive = False
+                break
+
+        if is_consecutive:
+            cost = sum([iv['value'] for iv in block])
+            if cost < best_cost:
+                best_cost = cost
+                best_block = block
+
+    if best_block is None:
+        return None
+    return {
+        'start': best_block[0]['start'],
+        'end': best_block[-1]['end'],
+        'price': best_cost / DAILY_BLOCK_INTERVALS,
+    }
 
 
-def _evaluate_morning_guarantee(bt7, cheap_slots, pool):
+def _plan_daily_block(prev_plan, intervals, tomorrow_date, now):
+    """Return the daily heating block plan, replanning only when due.
+
+    A plan is made once tomorrow's prices are published and covers the next
+    PLAN_WINDOW_HOURS. It is then kept, even after its block has run, until
+    the next day's prices arrive, so the block cannot drift onto pricier
+    hours as cheap ones pass. New prices never replace a block that has not
+    finished. Without a usable plan (first run, restart, prices missing for
+    PLAN_STALE_HOURS) it plans within the prices that are available.
+    """
+    interval_start = now.replace(minute=now.minute // 15 * 15, second=0, microsecond=0)
+
+    new_prices = tomorrow_date is not None and (
+        prev_plan is None or prev_plan['planned_for'] != tomorrow_date)
+    stale = prev_plan is None or now - prev_plan['planned_at'] > timedelta(hours=PLAN_STALE_HOURS)
+
+    if new_prices and (prev_plan is None or prev_plan['end'] <= now):
+        planned_for = tomorrow_date
+    elif stale and tomorrow_date is None:
+        planned_for = now.date().isoformat()
+    else:
+        return prev_plan
+
+    window_end = now + timedelta(hours=PLAN_WINDOW_HOURS)
+    block = _select_cheapest_block(intervals, interval_start, window_end)
+    if block is None:
+        return prev_plan
+
+    block['planned_for'] = planned_for
+    block['planned_at'] = now
+    return block
+
+
+def _plan_attributes(plan):
+    """Serialize a plan into status helper attributes."""
+    return {
+        'schedule_slots': json.dumps([{
+            'start': plan['start'].isoformat(),
+            'end': plan['end'].isoformat(),
+            'price': round(plan['price'], 4),
+        }]),
+        'plan_for_date': plan['planned_for'],
+        'plan_created': plan['planned_at'].isoformat(),
+    }
+
+
+def _load_stored_plan(attrs):
+    """Parse a plan stored by _plan_attributes, or None if absent or invalid."""
+    try:
+        slot = json.loads(attrs['schedule_slots'])[0]
+        return {
+            'start': datetime.fromisoformat(slot['start']),
+            'end': datetime.fromisoformat(slot['end']),
+            'price': slot['price'],
+            'planned_for': attrs['plan_for_date'],
+            'planned_at': datetime.fromisoformat(attrs['plan_created']),
+        }
+    except (KeyError, IndexError, TypeError, ValueError):
+        return None
+
+
+def _evaluate_morning_guarantee(bt7, block, pool):
     """Evaluate whether morning guarantee heating is needed and active now.
 
     Only active between 18:00 and 06:00. Projects BT7 at 06:00 using cooling
     rate and schedules cheapest consecutive heating block if projected temp
-    is below target.
+    is below target. The daily block's remaining heating before 06:00 is
+    credited, and the guarantee never schedules inside it.
 
     Returns (is_active, slot_info_string).
     """
@@ -151,15 +251,17 @@ def _evaluate_morning_guarantee(bt7, cheap_slots, pool):
     if current_hour >= 18:
         morning_target_time += timedelta(days=1)
 
-    # Account for heating from cheap slots that fall before 06:00
-    cheap_heating_hours = 0
-    for slot in cheap_slots:
-        if slot['hour_start'] < morning_target_time and slot['hour_end'] > now:
-            cheap_heating_hours += 1
-    heating_from_cheap = cheap_heating_hours * 4 * HEATING_RATE_PER_15MIN
+    # Account for heating from the daily block that falls before 06:00
+    heating_from_block = 0
+    if block:
+        overlap_start = max(block['start'], now)
+        overlap_end = min(block['end'], morning_target_time)
+        if overlap_end > overlap_start:
+            overlap_intervals = (overlap_end - overlap_start).total_seconds() / 900
+            heating_from_block = overlap_intervals * HEATING_RATE_PER_15MIN
 
-    # Project BT7 at 06:00 (cooling minus expected heating from cheap slots)
-    projected_bt7 = bt7 - (BT7_LOSS_RATE * hours_until_morning) + heating_from_cheap
+    # Project BT7 at 06:00 (cooling minus expected heating from the daily block)
+    projected_bt7 = bt7 - (BT7_LOSS_RATE * hours_until_morning) + heating_from_block
 
     if projected_bt7 >= BT7_MORNING_TARGET:
         return False, "not_needed"
@@ -171,21 +273,16 @@ def _evaluate_morning_guarantee(bt7, cheap_slots, pool):
         MORNING_GUARANTEE_MAX_INTERVALS
     )
 
-    # Exclude hours already in cheapest-3 schedule
-    cheap_hour_starts = set()
-    for slot in cheap_slots:
-        cheap_hour_starts.add(slot['hour_start'])
-
-    # Build available overnight 15-min intervals from non-cheap pool hours
+    # Build available overnight 15-min intervals outside the daily block
     overnight_intervals = []
     for hour_slot in pool:
-        if hour_slot['hour_start'] in cheap_hour_starts:
-            continue
         if hour_slot['hour_end'] > morning_target_time:
             continue
         for i in range(4):
             iv_start = hour_slot['hour_start'] + timedelta(minutes=15 * i)
             iv_end = hour_slot['hour_start'] + timedelta(minutes=15 * (i + 1))
+            if block and iv_start < block['end'] and iv_end > block['start']:
+                continue
             if iv_end > now:
                 overnight_intervals.append({
                     'start': iv_start,
@@ -279,7 +376,6 @@ def _make_heating_decision():
     """
     debug = {
         'schedule_source': 'not_evaluated',
-        'schedule_slots': '[]',
         'next_cheap_start': 'not_evaluated',
         'morning_guarantee_slot': 'not_evaluated',
     }
@@ -323,37 +419,29 @@ def _make_heating_decision():
     if _check_solar_override():
         return 1, "solar_override", debug
 
-    # --- Layer 3: Cheapest 3 hours ---
-    cheap_slots = []
+    # --- Layer 3: Daily cheapest 3h block ---
+    plan = None
     pool = []
     try:
-        pool, source = _build_hourly_price_pool()
+        intervals, tomorrow_date, source = _load_price_intervals()
         debug['schedule_source'] = source
+        pool = _build_hourly_price_pool(intervals)
 
-        cheap_slots = _select_cheapest_hours(pool, count=3)
-        debug['schedule_slots'] = json.dumps([{
-            'start': s['hour_start'].isoformat(),
-            'end': s['hour_end'].isoformat(),
-            'price': round(s['price'], 4)
-        } for s in cheap_slots])
+        prev_plan = _load_stored_plan(state.getattr('input_number.hot_water_heating_status') or {})
+        plan = _plan_daily_block(prev_plan, intervals, tomorrow_date, now)
+        if plan:
+            debug.update(_plan_attributes(plan))
+            debug['next_cheap_start'] = plan['start'].isoformat() if plan['end'] > now else 'none_remaining'
 
-        # Next upcoming cheap slot
-        upcoming = [s for s in cheap_slots if s['hour_end'] > now]
-        debug['next_cheap_start'] = upcoming[0]['hour_start'].isoformat() if upcoming else 'none_remaining'
-
-        # Check if current hour is in cheapest 3
-        current_hour_start = now.replace(minute=0, second=0, microsecond=0)
-        for slot in cheap_slots:
-            if slot['hour_start'] <= current_hour_start < slot['hour_end']:
+            if plan['start'] <= now < plan['end']:
                 return 1, "cheapest_3h", debug
     except Exception as e:
         debug['schedule_error'] = str(e)
-        debug['schedule_slots'] = '[]'
         debug['schedule_source'] = 'error'
 
     # --- Layer 4: Morning guarantee ---
     try:
-        mg_active, mg_info = _evaluate_morning_guarantee(bt7, cheap_slots, pool)
+        mg_active, mg_info = _evaluate_morning_guarantee(bt7, plan, pool)
         debug['morning_guarantee_slot'] = mg_info
         if mg_active:
             return 1, "morning_guarantee", debug
@@ -430,27 +518,6 @@ def updateHotWaterHeatingStatus():
         current_status = 0
         attrs = None
         current_reason = ''
-
-    # Stability rule: don't drop cheapest_3h mid-hour on recalculation
-    if (current_status > 0.5
-            and current_reason in ('cheapest_3h', 'cheapest_3h_stability')
-            and status == 0):
-        current_hour_start = now.replace(minute=0, second=0, microsecond=0)
-        try:
-            prev_slots_str = attrs.get('schedule_slots', '[]') if attrs else '[]'
-            prev_slots = json.loads(prev_slots_str)
-            for slot in prev_slots:
-                slot_start = datetime.fromisoformat(slot['start'])
-                slot_end = datetime.fromisoformat(slot['end'])
-                if slot_start <= current_hour_start < slot_end:
-                    status = 1
-                    reason = "cheapest_3h_stability"
-                    # Preserve previous schedule for next stability check
-                    debug['schedule_slots'] = prev_slots_str
-                    debug['schedule_source'] = attrs.get('schedule_source', 'unknown') if attrs else 'unknown'
-                    break
-        except:
-            pass
 
     # Stability rule: don't drop morning_guarantee mid-block on recalculation
     if (current_status > 0.5

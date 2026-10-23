@@ -50,9 +50,8 @@ def test_morning_guarantee_active_mid_block(hotwater):
             _hour(2026, 1, 16, 0, tz, 5.0),
             _hour(2026, 1, 16, 1, tz, 5.0),
         ]
-        cheap_slots = []  # nothing pre-reserved
         # bt7 low enough to need heating (huge deficit -> multiple intervals).
-        active, info = hotwater._evaluate_morning_guarantee(30.0, cheap_slots, pool)
+        active, info = hotwater._evaluate_morning_guarantee(30.0, None, pool)
 
         assert active is True
         assert " - " in info
@@ -71,7 +70,7 @@ def test_not_active_before_18(hotwater):
     with freeze_time("2026-01-15 17:59:00"):
         tz = _local_tz()
         pool = [_hour(2026, 1, 15, 18, tz, 1.0)]
-        active, info = hotwater._evaluate_morning_guarantee(30.0, [], pool)
+        active, info = hotwater._evaluate_morning_guarantee(30.0, None, pool)
         assert active is False
         assert info == "not_active_hours"
 
@@ -86,7 +85,7 @@ def test_active_at_18_with_deficit_schedules(hotwater):
             pool.append(_hour(2026, 1, 15, h, tz, 2.0))
         for h in range(0, 6):
             pool.append(_hour(2026, 1, 16, h, tz, 2.0))
-        active, info = hotwater._evaluate_morning_guarantee(30.0, [], pool)
+        active, info = hotwater._evaluate_morning_guarantee(30.0, None, pool)
         # Deficit exists; a consecutive block is found. It may or may not be
         # active at 18:00 depending on chosen cheapest block, but info must be
         # an iso range (not a "not_*" sentinel).
@@ -105,7 +104,7 @@ def test_cross_midnight_block_never_past_0600(hotwater):
             _hour(2026, 1, 16, 5, tz, 2.0),
             _hour(2026, 1, 16, 6, tz, 2.0),  # must be excluded (ends 07:00)
         ]
-        active, info = hotwater._evaluate_morning_guarantee(30.0, [], pool)
+        active, info = hotwater._evaluate_morning_guarantee(30.0, None, pool)
         assert " - " in info
         _start, end_str = info.split(" - ")
         block_end = datetime.datetime.fromisoformat(end_str.strip())
@@ -123,7 +122,7 @@ def test_not_needed_when_projected_at_target(hotwater):
         pool = [_hour(2026, 1, 15, 23, tz, 2.0)]
         # 23:00 -> hours_until_morning = 7. loss = 1.5*7 = 10.5.
         # Need projected = bt7 - 10.5 >= 50 -> bt7 >= 60.5.
-        active, info = hotwater._evaluate_morning_guarantee(61.0, [], pool)
+        active, info = hotwater._evaluate_morning_guarantee(61.0, None, pool)
         assert active is False
         assert info == "not_needed"
 
@@ -145,7 +144,7 @@ def test_needed_intervals_rounding(hotwater, monkeypatch):
             _hour(2026, 1, 15, 23, tz, 1.0),
             _hour(2026, 1, 16, 0, tz, 5.0),
         ]
-        active, info = hotwater._evaluate_morning_guarantee(57.9, [], pool)
+        active, info = hotwater._evaluate_morning_guarantee(57.9, None, pool)
         assert " - " in info
         start_str, end_str = info.split(" - ")
         block_start = datetime.datetime.fromisoformat(start_str.strip())
@@ -165,7 +164,7 @@ def test_needed_intervals_capped(hotwater):
         for h in range(0, 6):
             pool.append(_hour(2026, 1, 16, h, tz, 2.0))
         # bt7 very low -> deficit >> max.
-        active, info = hotwater._evaluate_morning_guarantee(10.0, [], pool)
+        active, info = hotwater._evaluate_morning_guarantee(10.0, None, pool)
         assert " - " in info
         start_str, end_str = info.split(" - ")
         block_start = datetime.datetime.fromisoformat(start_str.strip())
@@ -174,68 +173,43 @@ def test_needed_intervals_capped(hotwater):
         assert (block_end - block_start) <= datetime.timedelta(minutes=max_minutes)
 
 
-# --- cheap-slot exclusion -----------------------------------------------------
+# --- daily block exclusion ----------------------------------------------------
 
 
-def test_cheap_slots_excluded_from_block(hotwater):
-    """Hours present in cheap_slots never appear in the chosen block."""
+def test_daily_block_excluded_from_guarantee(hotwater):
+    """Intervals inside the daily block never appear in the guarantee block."""
     with freeze_time("2026-01-15 23:00:00"):
         tz = _local_tz()
-        cheap_hour = _hour(2026, 1, 15, 23, tz, 0.5)  # cheapest, but reserved
+        cheap_hour = _hour(2026, 1, 15, 23, tz, 0.5)  # cheapest, but in the daily block
         pool = [
             cheap_hour,
             _hour(2026, 1, 16, 0, tz, 2.0),
             _hour(2026, 1, 16, 1, tz, 2.0),
         ]
-        cheap_slots = [cheap_hour]
-        active, info = hotwater._evaluate_morning_guarantee(40.0, cheap_slots, pool)
+        block = {"start": cheap_hour["hour_start"], "end": cheap_hour["hour_end"]}
+        active, info = hotwater._evaluate_morning_guarantee(40.0, block, pool)
         assert " - " in info
         start_str, _end = info.split(" - ")
         block_start = datetime.datetime.fromisoformat(start_str.strip())
-        # Block must not start within the reserved 23:00-00:00 hour.
         assert block_start >= datetime.datetime(2026, 1, 16, 0, 0, 0, tzinfo=tz)
 
 
-# --- stability rules via updateHotWaterHeatingStatus --------------------------
-
-
-def test_cheapest_3h_stability(hotwater, world, monkeypatch):
-    """Prior reason cheapest_3h + stored schedule_slots covering now -> forced 1."""
-    with freeze_time("2026-01-15 23:30:00"):
+def test_daily_block_before_morning_credited(hotwater):
+    """A 3h daily block before 06:00 covers the deficit -> guarantee not needed."""
+    with freeze_time("2026-01-15 23:00:00"):
         tz = _local_tz()
-        current_hour = datetime.datetime(2026, 1, 15, 23, 0, 0, tzinfo=tz)
-        slots = [{
-            "start": current_hour.isoformat(),
-            "end": (current_hour + datetime.timedelta(hours=1)).isoformat(),
-            "price": 1.0,
-        }]
-        attrs = {
-            "input_number.hot_water_heating_status": {
-                "reason": "cheapest_3h",
-                "schedule_slots": json.dumps(slots),
-                "schedule_source": "today_tomorrow",
-            }
+        pool = [_hour(2026, 1, 15, 23, tz, 2.0)]
+        block = {
+            "start": datetime.datetime(2026, 1, 16, 2, 0, 0, tzinfo=tz),
+            "end": datetime.datetime(2026, 1, 16, 5, 0, 0, tzinfo=tz),
         }
-        get = {"input_number.hot_water_heating_status": "1"}
-        w = world(hotwater, get=get, attrs=attrs)
-        # Decision layer would drop to 0/default_block; stability must override.
-        monkeypatch.setattr(
-            hotwater, "_make_heating_decision",
-            lambda: (0, "default_block", {
-                "schedule_source": "today_tomorrow",
-                "schedule_slots": "[]",
-                "next_cheap_start": "none",
-                "morning_guarantee_slot": "not_evaluated",
-            }),
-        )
+        # 23:00 -> loss 1.5 * 7 = 10.5; block credit 12 * 1.25 = 15; 46 - 10.5 + 15 = 50.5.
+        active, info = hotwater._evaluate_morning_guarantee(46.0, block, pool)
+        assert active is False
+        assert info == "not_needed"
 
-        hotwater.updateHotWaterHeatingStatus()
 
-        # L14: status value + attrs written via one state.set(name, value, **kwargs).
-        assert ("input_number.hot_water_heating_status", 1) in w.state.set_calls
-        assert w.state.attrs_written[
-            "input_number.hot_water_heating_status.reason"
-        ] == "cheapest_3h_stability"
+# --- stability rules via updateHotWaterHeatingStatus --------------------------
 
 
 def test_morning_guarantee_stability(hotwater, world, monkeypatch):
@@ -270,3 +244,164 @@ def test_morning_guarantee_stability(hotwater, world, monkeypatch):
         assert w.state.attrs_written[
             "input_number.hot_water_heating_status.reason"
         ] == "morning_guarantee_stability"
+
+
+# --- daily cheapest 3h block plan ---------------------------------------------
+
+
+def _intervals(start, prices):
+    """Consecutive 15-min price intervals beginning at ``start``."""
+    out = []
+    for i in range(len(prices)):
+        iv_start = start + datetime.timedelta(minutes=15 * i)
+        out.append({
+            "start": iv_start,
+            "end": iv_start + datetime.timedelta(minutes=15),
+            "value": prices[i],
+        })
+    return out
+
+
+def _plan(start, end, planned_for, planned_at, price=1.0):
+    return {
+        "start": start,
+        "end": end,
+        "price": price,
+        "planned_for": planned_for,
+        "planned_at": planned_at,
+    }
+
+
+def test_new_prices_plan_cheapest_consecutive_3h(hotwater):
+    """Tomorrow's prices arrive -> cheapest 12 consecutive intervals in next 24h."""
+    with freeze_time("2026-01-15 14:20:00"):
+        tz = _local_tz()
+        now = datetime.datetime.now().astimezone()
+        day_start = datetime.datetime(2026, 1, 15, 0, 0, 0, tzinfo=tz)
+        prices = [10.0] * (48 * 4)
+        # Cheap 03:00-06:00 tomorrow, plus one lone very cheap interval.
+        for i in range(27 * 4, 30 * 4):
+            prices[i] = 1.0
+        prices[40 * 4] = 0.1
+        intervals = _intervals(day_start, prices)
+
+        plan = hotwater._plan_daily_block(None, intervals, "2026-01-16", now)
+
+        assert plan["start"] == datetime.datetime(2026, 1, 16, 3, 0, 0, tzinfo=tz)
+        assert plan["end"] == datetime.datetime(2026, 1, 16, 6, 0, 0, tzinfo=tz)
+        assert plan["planned_for"] == "2026-01-16"
+
+
+def test_plan_window_limited_to_24h(hotwater):
+    """A cheaper block more than 24h after planning is out of reach."""
+    with freeze_time("2026-01-15 14:20:00"):
+        tz = _local_tz()
+        now = datetime.datetime.now().astimezone()
+        day_start = datetime.datetime(2026, 1, 15, 0, 0, 0, tzinfo=tz)
+        prices = [10.0] * (48 * 4)
+        for i in range(20 * 4, 23 * 4):     # today 20:00-23:00
+            prices[i] = 5.0
+        for i in range(44 * 4, 47 * 4):     # tomorrow 20:00-23:00, cheaper
+            prices[i] = 1.0
+        intervals = _intervals(day_start, prices)
+
+        plan = hotwater._plan_daily_block(None, intervals, "2026-01-16", now)
+
+        assert plan["start"] == datetime.datetime(2026, 1, 15, 20, 0, 0, tzinfo=tz)
+
+
+def test_plan_kept_after_block_passed(hotwater):
+    """The drift bug: once the block has run, no new block until new prices."""
+    with freeze_time("2026-01-16 07:03:00"):
+        tz = _local_tz()
+        now = datetime.datetime.now().astimezone()
+        prev = _plan(
+            datetime.datetime(2026, 1, 16, 3, 0, 0, tzinfo=tz),
+            datetime.datetime(2026, 1, 16, 6, 0, 0, tzinfo=tz),
+            "2026-01-16",
+            datetime.datetime(2026, 1, 15, 14, 20, 0, tzinfo=tz),
+        )
+        intervals = _intervals(
+            datetime.datetime(2026, 1, 16, 0, 0, 0, tzinfo=tz), [10.0] * 96)
+
+        plan = hotwater._plan_daily_block(prev, intervals, None, now)
+
+        assert plan is prev
+
+
+def test_new_prices_wait_for_running_block(hotwater):
+    """New prices mid-block: keep the running block, replan after it ends."""
+    with freeze_time("2026-01-16 14:20:00"):
+        tz = _local_tz()
+        now = datetime.datetime.now().astimezone()
+        prev = _plan(
+            datetime.datetime(2026, 1, 16, 13, 0, 0, tzinfo=tz),
+            datetime.datetime(2026, 1, 16, 16, 0, 0, tzinfo=tz),
+            "2026-01-16",
+            datetime.datetime(2026, 1, 15, 14, 20, 0, tzinfo=tz),
+        )
+        intervals = _intervals(
+            datetime.datetime(2026, 1, 16, 0, 0, 0, tzinfo=tz), [10.0] * 192)
+
+        assert hotwater._plan_daily_block(prev, intervals, "2026-01-17", now) is prev
+
+    with freeze_time("2026-01-16 16:03:00"):
+        now = datetime.datetime.now().astimezone()
+        plan = hotwater._plan_daily_block(prev, intervals, "2026-01-17", now)
+        assert plan["planned_for"] == "2026-01-17"
+        assert plan["start"] >= prev["end"]
+
+
+def test_no_plan_falls_back_to_rest_of_today(hotwater):
+    """No stored plan and no tomorrow prices -> plan within remaining today."""
+    with freeze_time("2026-01-16 08:10:00"):
+        tz = _local_tz()
+        now = datetime.datetime.now().astimezone()
+        prices = [10.0] * 96
+        for i in range(2 * 4, 5 * 4):       # 02:00-05:00, already passed
+            prices[i] = 0.5
+        for i in range(12 * 4, 15 * 4):     # 12:00-15:00
+            prices[i] = 3.0
+        intervals = _intervals(
+            datetime.datetime(2026, 1, 16, 0, 0, 0, tzinfo=tz), prices)
+
+        plan = hotwater._plan_daily_block(None, intervals, None, now)
+
+        assert plan["start"] == datetime.datetime(2026, 1, 16, 12, 0, 0, tzinfo=tz)
+        assert plan["planned_for"] == "2026-01-16"
+
+
+def test_stale_plan_replanned(hotwater):
+    """Prices missing for over 36h -> fall back instead of never heating."""
+    with freeze_time("2026-01-17 08:10:00"):
+        tz = _local_tz()
+        now = datetime.datetime.now().astimezone()
+        prev = _plan(
+            datetime.datetime(2026, 1, 16, 3, 0, 0, tzinfo=tz),
+            datetime.datetime(2026, 1, 16, 6, 0, 0, tzinfo=tz),
+            "2026-01-16",
+            datetime.datetime(2026, 1, 15, 14, 20, 0, tzinfo=tz),
+        )
+        intervals = _intervals(
+            datetime.datetime(2026, 1, 17, 0, 0, 0, tzinfo=tz), [10.0] * 96)
+
+        plan = hotwater._plan_daily_block(prev, intervals, None, now)
+
+        assert plan["planned_for"] == "2026-01-17"
+        assert plan["start"] >= datetime.datetime(2026, 1, 17, 8, 0, 0, tzinfo=tz)
+
+
+def test_stored_plan_round_trip(hotwater):
+    with freeze_time("2026-01-15 14:20:00"):
+        tz = _local_tz()
+        plan = _plan(
+            datetime.datetime(2026, 1, 16, 3, 0, 0, tzinfo=tz),
+            datetime.datetime(2026, 1, 16, 6, 0, 0, tzinfo=tz),
+            "2026-01-16",
+            datetime.datetime(2026, 1, 15, 14, 20, 0, tzinfo=tz),
+        )
+        attrs = hotwater._plan_attributes(plan)
+        loaded = hotwater._load_stored_plan(attrs)
+        assert loaded == plan
+        # Attributes from before the daily plan existed carry no plan.
+        assert hotwater._load_stored_plan({"schedule_slots": attrs["schedule_slots"]}) is None
