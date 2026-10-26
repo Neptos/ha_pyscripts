@@ -58,6 +58,23 @@ Books the hourly value of the solar panels and the Elisa-controlled home battery
 - Car/heat pump "with solar" cost = their share of the non-solar house consumption (grid_to_house + battery_to_house), priced at the buy price; battery energy is deliberately priced as grid energy so the battery's benefit appears only in the battery metric
 - When the flow totals are unavailable, books cost-with-solar equal to cost-without-solar and leaves the savings metrics untouched
 
+### EnergyContext.py
+Every 5 minutes, computes the net solar surplus that solar-aware consumers (heating offsets, hot water, Nibe SPA, Tesla) share, so they react to spare solar instead of raw PV power and do not starve the Elisa-controlled battery.
+
+**Read Sensors**:
+- `sensor.kotiakku_solar_to_grid_kw`, `sensor.kotiakku_solar_to_battery_kw`, `sensor.kotiakku_battery_to_house_kw`, `sensor.kotiakku_grid_to_house_kw` - live flows (W despite the name)
+- `sensor.kotiakku_state_of_charge_percent` - battery SOC
+- `sensor.energy_production_today_remaining` - Forecast.Solar remaining production today
+- `sun.sun` - next setting
+
+**Write Sensors** (create as input_number helper, min -20000, max 20000, unit W):
+- `input_number.net_solar_surplus` - plus the inputs as attributes; 0 with `data_available: false` when Kotiakku data is missing
+
+**Logic**:
+- Net surplus = solar_to_grid - battery_to_house - grid_to_house, plus solar_to_battery when the battery fills anyway; negative when loads already draw from battery or grid
+- Battery fills anyway = SOC >= 94 %, or remaining forecast x 0.8 - 0.7 kW base load until sunset - headroom to 95 % of 21 kWh >= 2 kWh (the forecast has overestimated several times over on dull days)
+- Consumers start above their own threshold and keep running while surplus + their own draw stays high enough and the surplus stays above -1 kW
+
 ### UpdateSpotPriceSensors.py
 Creates electricity cost indicators (0-3 scale) based on short-term (today+tomorrow) and long-term (10 days) price trends.
 

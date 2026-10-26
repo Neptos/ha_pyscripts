@@ -265,3 +265,8 @@ def savings():
 @pytest.fixture(scope="session")
 def hotwater():
     return load_pyscript("HotWaterOptimizer.py")
+
+
+@pytest.fixture(scope="session")
+def energy():
+    return load_pyscript("EnergyContext.py")
