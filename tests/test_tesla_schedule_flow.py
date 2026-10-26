@@ -433,12 +433,14 @@ def test_controller_writes_status_at_most_once(tesla, world):
             tesla.OUTPUT_MAX_AVG_PRICE: "0",
             tesla.SELL_PRICE_SENSOR: "2.0",
             tesla.TESLA_CHARGE_CURRENT: "0",
-            tesla.GRID_POWER_15MIN_AVG: "-500",
-            tesla.GRID_POWER_CURRENT: "-500",
+            tesla.NET_SOLAR_SURPLUS: "-500",
             tesla.SUN_NEXT_RISING: "2026-01-16T06:00:00+02:00",
             tesla.SUN_NEXT_SETTING: "2026-01-16T16:00:00+02:00",
         }
-        attrs = {tesla.NORDPOOL_SENSOR: _nordpool_attrs(_price_entries(base, prices))}
+        attrs = {
+            tesla.NORDPOOL_SENSOR: _nordpool_attrs(_price_entries(base, prices)),
+            tesla.NET_SOLAR_SURPLUS: {"data_available": True},
+        }
         w = world(tesla, get=get, attrs=attrs)
 
         tesla.tesla_charging_control()

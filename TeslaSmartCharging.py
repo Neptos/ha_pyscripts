@@ -88,11 +88,12 @@ KEY FEATURES
 GRID POWER CONVENTION
 ================================================================================
 
-Grid power convention for sensor.power_meter_active_power:
-  - POSITIVE values = exporting power to grid (solar surplus)
-  - NEGATIVE values = importing power from grid (consumption)
+Surplus convention for input_number.net_solar_surplus (EnergyContext.py):
+  - POSITIVE values = spare solar (would otherwise be exported, or go into a
+    battery that fills anyway)
+  - NEGATIVE values = the house draws from the battery or the grid
 
-Example: grid_power = +2000 means exporting 2kW to the grid
+Example: grid_power = +2000 means 2kW of spare solar
 
 ================================================================================
 TRIGGER SCHEDULE SUMMARY
@@ -216,9 +217,8 @@ SELL_PRICE_SENSOR = "sensor.electricity_sell_price"
 SOLAR_REMAINING_TODAY = "sensor.energy_production_today_remaining"
 SOLAR_PRODUCTION_TOMORROW = "sensor.energy_production_tomorrow"
 
-# --- Solar Production/Grid Entities ---
-GRID_POWER_CURRENT = "sensor.power_meter_active_power"
-GRID_POWER_15MIN_AVG = "sensor.power_meter_active_power_15min"
+# --- Solar Surplus (EnergyContext.py, battery-aware, positive = spare solar) ---
+NET_SOLAR_SURPLUS = "input_number.net_solar_surplus"
 
 # --- Sun Entities ---
 SUN_NEXT_RISING = "sensor.sun_next_rising"
@@ -2078,8 +2078,13 @@ def _gather_controller_inputs():
     is_charging = _is_currently_charging()
     is_daylight = _is_during_daylight()
 
-    grid_power_instant = _read_grid_power(GRID_POWER_CURRENT)
-    grid_power_avg = _read_grid_power(GRID_POWER_15MIN_AVG)
+    # The net surplus is already a 5-min value that subtracts the car's own
+    # draw, so it serves as both the instant and the averaged input.
+    net_surplus = _read_grid_power(NET_SOLAR_SURPLUS)
+    if not (state.getattr(NET_SOLAR_SURPLUS) or {}).get('data_available'):
+        net_surplus = None
+    grid_power_instant = net_surplus
+    grid_power_avg = net_surplus
 
     try:
         tesla_power_w = float(state.get(TESLA_CHARGER_POWER) or 0) * 1000
@@ -2375,7 +2380,7 @@ def teslaSmartChargingTestService(action=None, id=None):
     log.info(f"Current SOC: {_get_current_soc()}%")
     log.info(f"Charge limit: {_get_charge_limit()}%")
     log.info(f"Is daylight: {_is_during_daylight()}")
-    log.info(f"Grid power (15min avg): {state.get(GRID_POWER_15MIN_AVG)}W")
+    log.info(f"Net solar surplus: {state.get(NET_SOLAR_SURPLUS)}W")
 
     sunrise, sunset = _get_sunrise_sunset()
     log.info(f"Sunrise: {sunrise}, Sunset: {sunset}")

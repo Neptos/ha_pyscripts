@@ -250,11 +250,10 @@ def test_is_solar_only_mode_reads_helper(tesla, world):
 
 
 def test_gather_controller_inputs_grid_unavailable(tesla, world):
-    """_gather_controller_inputs: 'unavailable' grid -> None + warning logged."""
+    """_gather_controller_inputs: 'unavailable' net surplus -> None + warning logged."""
     tesla._GRID_WARNED.clear()  # warn-once state persists on the session-scoped module
     get = {
-        tesla.GRID_POWER_CURRENT: "unavailable",
-        tesla.GRID_POWER_15MIN_AVG: "500",
+        tesla.NET_SOLAR_SURPLUS: "unavailable",
         tesla.TESLA_CHARGER_POWER: "0",
     }
     w = world(tesla, get=get)
@@ -262,9 +261,37 @@ def test_gather_controller_inputs_grid_unavailable(tesla, world):
     inputs = tesla._gather_controller_inputs()
 
     assert inputs['grid_power_instant'] is None
+    assert inputs['grid_power_avg'] is None
     warnings = [msg for (lvl, msg) in w.log.records
                 if lvl == "warning" and "Grid power sensor unavailable" in str(msg)]
     assert warnings
+
+
+def test_gather_controller_inputs_reads_net_surplus(tesla, world):
+    """Both surplus inputs carry EnergyContext's net solar surplus."""
+    tesla._GRID_WARNED.clear()
+    get = {tesla.NET_SOLAR_SURPLUS: "2500", tesla.TESLA_CHARGER_POWER: "0"}
+    attrs = {tesla.NET_SOLAR_SURPLUS: {"data_available": True}}
+    world(tesla, get=get, attrs=attrs)
+
+    inputs = tesla._gather_controller_inputs()
+
+    assert inputs['grid_power_instant'] == 2500.0
+    assert inputs['grid_power_avg'] == 2500.0
+
+
+def test_gather_controller_inputs_net_surplus_without_data(tesla, world):
+    """EnergyContext writes 0 with data_available false when Kotiakku data is
+    missing; treat that as unavailable so solar charging cannot sustain on it."""
+    tesla._GRID_WARNED.clear()
+    get = {tesla.NET_SOLAR_SURPLUS: "0", tesla.TESLA_CHARGER_POWER: "0"}
+    attrs = {tesla.NET_SOLAR_SURPLUS: {"data_available": False}}
+    world(tesla, get=get, attrs=attrs)
+
+    inputs = tesla._gather_controller_inputs()
+
+    assert inputs['grid_power_instant'] is None
+    assert inputs['grid_power_avg'] is None
 
 
 def test_read_grid_power_warns_once_and_recovers(tesla, world):
