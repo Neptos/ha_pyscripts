@@ -10,7 +10,9 @@ HEATING_RATE_PER_15MIN = 1.25  # °C per 15-min heating interval (net, after los
 MORNING_GUARANTEE_MAX_INTERVALS = 8  # 2 hours max (8 x 15min)
 DAILY_BLOCK_INTERVALS = 12     # 3 hours (12 x 15min)
 PLAN_WINDOW_HOURS = 24
-SOLAR_POWER_THRESHOLD = 3000   # Watts
+SOLAR_START_W = 2000           # net solar surplus to start heating on solar
+SOLAR_KEEP_W = 1500            # net surplus + heat pump draw to keep heating
+SOLAR_MAX_DRAIN_W = 1000       # stop if the house leans on battery/grid by more
 
 
 def _parse_dt(value):
@@ -316,17 +318,20 @@ def _evaluate_morning_guarantee(bt7, block, pool):
     return False, slot_info
 
 
-def _check_solar_override():
-    """Check if solar production justifies allowing heating.
+def _solar_override_active(net_surplus, heatpump_power_w, running_on_solar):
+    """Whether spare solar justifies heating, from EnergyContext's net surplus.
 
-    Returns True if inverter > 3kW AND Tesla wall connector not charging.
+    Starts above SOLAR_START_W. Once running, the heat pump's own draw is
+    added back so heating does not switch itself off, but it stops when the
+    house leans on the battery or grid by more than SOLAR_MAX_DRAIN_W (the
+    immersion heater can draw far more than the surplus).
     """
-    try:
-        inverter_power = float(state.get('sensor.inverter_average_active_power'))
-        tesla_charging = state.get('binary_sensor.tesla_wall_connector_contactor_closed') == 'on'
-        return inverter_power > SOLAR_POWER_THRESHOLD and not tesla_charging
-    except:
+    if net_surplus is None:
         return False
+    if running_on_solar:
+        return (net_surplus >= -SOLAR_MAX_DRAIN_W
+                and net_surplus + heatpump_power_w >= SOLAR_KEEP_W)
+    return net_surplus >= SOLAR_START_W
 
 
 def _check_temperature_safety(bt7, cost_zone, current_status):
@@ -406,7 +411,19 @@ def _make_heating_decision():
         return 1, "manual_override", debug
 
     # --- Layer 2: Solar override ---
-    if _check_solar_override():
+    try:
+        net_surplus = float(state.get('input_number.net_solar_surplus'))
+        if not (state.getattr('input_number.net_solar_surplus') or {}).get('data_available'):
+            net_surplus = None
+    except (ValueError, TypeError, NameError):
+        net_surplus = None
+    try:
+        heatpump_power_w = float(state.get('sensor.heatpump_power_usage'))
+    except (ValueError, TypeError, NameError):
+        heatpump_power_w = 0.0
+    current_reason = (state.getattr('input_number.hot_water_heating_status') or {}).get('reason')
+    running_on_solar = current_status > 0.5 and current_reason == "solar_override"
+    if _solar_override_active(net_surplus, heatpump_power_w, running_on_solar):
         return 1, "solar_override", debug
 
     # --- Layer 3: Daily cheapest 3h block ---

@@ -412,3 +412,25 @@ def test_stored_plan_round_trip(hotwater):
         assert loaded == plan
         # Attributes from before the daily plan existed carry no plan.
         assert hotwater._load_stored_plan({"schedule_slots": attrs["schedule_slots"]}) is None
+
+
+# --- solar override on net solar surplus --------------------------------------
+
+
+def test_solar_override_starts_above_threshold(hotwater):
+    assert hotwater._solar_override_active(2000.0, 300.0, False) is True
+    assert hotwater._solar_override_active(1999.0, 300.0, False) is False
+
+
+def test_solar_override_keeps_with_own_draw_added_back(hotwater):
+    # Heating took 2 kW of a 2.2 kW surplus: 200 + 2000 >= 1500 keeps it on.
+    assert hotwater._solar_override_active(200.0, 2000.0, True) is True
+
+
+def test_solar_override_stops_when_draining_battery(hotwater):
+    # Immersion heater 7 kW on a 3 kW surplus: -4000 + 7000 looks fine, but drains 4 kW.
+    assert hotwater._solar_override_active(-4000.0, 7000.0, True) is False
+
+
+def test_solar_override_off_without_surplus_data(hotwater):
+    assert hotwater._solar_override_active(None, 0.0, True) is False
