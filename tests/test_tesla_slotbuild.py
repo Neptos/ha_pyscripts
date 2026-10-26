@@ -86,7 +86,8 @@ def test_slotbuild_injected_deterministic(tesla, as_dt):
 
 def test_slotbuild_naive_datetime_start(tesla):
     """Naive datetime starts exercise the .astimezone() fallback and still key."""
-    local_tz = datetime.datetime.now().astimezone().tzinfo
+    # The July offset, not today's: across a DST change they differ by an hour.
+    local_tz = datetime.datetime(2026, 7, 1, 12, 0, 0).astimezone().tzinfo
     now = datetime.datetime(2026, 7, 1, 12, 0, 0, tzinfo=local_tz)
 
     # Naive datetime starts (no tzinfo). Builder assumes local via .astimezone().
